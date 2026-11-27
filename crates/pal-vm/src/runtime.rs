@@ -6933,18 +6933,26 @@ impl ScriptRuntime {
                     snapshot.thumb_height = self.save_state.thumbnail_size[1];
                     snapshot.thumb_pixels = self.save_state.thumbnail_pixels.clone();
                 }
-                self.save_state.snapshots.insert(slot, snapshot.clone());
-                if let Some(manager) = resource_manager.as_deref() {
+                let persisted = resource_manager.as_deref().is_some_and(|manager| {
                     match self.write_original_save(manager.root(), slot, &snapshot, nls) {
-                        Ok(path) => log::debug!(
-                            "[trace-save] save slot={slot} pc=0x{:08X} file={}",
-                            snapshot.pc,
-                            path.display()
-                        ),
+                        Ok(path) => {
+                            log::debug!(
+                                "[trace-save] save slot={slot} pc=0x{:08X} file={}",
+                                snapshot.pc,
+                                path.display()
+                            );
+                            true
+                        }
                         Err(err) => {
-                            log::warn!("[trace-save] save slot={slot} file failed: {err}")
+                            log::warn!("[trace-save] save slot={slot} file failed: {err}");
+                            false
                         }
                     }
+                });
+                if persisted {
+                    self.save_state.snapshots.remove(&slot);
+                } else {
+                    self.save_state.snapshots.insert(slot, snapshot);
                 }
                 self.save_state.last_result = 1;
                 ExtCallOutcome::Value(1)
@@ -6971,7 +6979,6 @@ impl ScriptRuntime {
                     .as_deref_mut()
                     .and_then(|manager| self.import_original_save_with_resources(manager, slot, assets))
                 {
-                    self.save_state.snapshots.insert(slot, snapshot.clone());
                     log::debug!(
                         "[trace-save] load slot={slot} imported original save, resume pc=0x{:08X}",
                         snapshot.pc
@@ -7476,9 +7483,7 @@ impl ScriptRuntime {
             false
         };
         if copied {
-            if let Some(snapshot) = self.save_state.snapshots.get(&src).cloned() {
-                self.save_state.snapshots.insert(dest, snapshot);
-            }
+            self.save_state.snapshots.remove(&dest);
             if let Some(lock) = self.save_state.locks.get(&src).copied() {
                 self.save_state.locks.insert(dest, lock);
             }
@@ -19960,6 +19965,51 @@ mod tests {
         assert!(err.is_err(), "oversized temp_mem must not be allocated");
 
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn persisted_save_releases_slot_cache_and_loads_from_disk() {
+        let root = std::env::temp_dir().join(format!(
+            "sena_rs_save_cache_{}_{}",
+            std::process::id(),
+            SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let (assets, _) = empty_core_assets(false);
+        let mut manager = ResourceManager::new(&root, Nls::ShiftJis);
+        let mut runtime = ScriptRuntime::boot(0x1000, ScriptRuntimeConfig::default());
+        runtime.save_state.armed = true;
+        runtime.save_state.checkpoint = Some(runtime.capture_save_snapshot());
+
+        // A failed write still leaves an in-session save available.
+        std::fs::create_dir_all(&root).unwrap();
+        let blocked_directory = original_save_path(&root, 3).parent().unwrap().to_owned();
+        std::fs::write(&blocked_directory, []).unwrap();
+        runtime.stack.extend_from_slice(&[0, 3]);
+        assert!(matches!(
+            runtime.dispatch_save_stub(0, &assets, Nls::ShiftJis, Some(&mut manager), None),
+            ExtCallOutcome::Value(1)
+        ));
+        assert!(runtime.save_state.snapshots.contains_key(&3));
+
+        // A successful retry replaces the in-memory copy with the disk file.
+        std::fs::remove_file(blocked_directory).unwrap();
+        runtime.stack.extend_from_slice(&[0, 3]);
+        assert!(matches!(
+            runtime.dispatch_save_stub(0, &assets, Nls::ShiftJis, Some(&mut manager), None),
+            ExtCallOutcome::Value(1)
+        ));
+        assert!(runtime.save_state.snapshots.is_empty());
+        assert!(original_save_path(&root, 3).is_file());
+
+        runtime.pc = 0x2000;
+        runtime.stack.push(3);
+        assert!(matches!(
+            runtime.dispatch_save_stub(1, &assets, Nls::ShiftJis, Some(&mut manager), None),
+            ExtCallOutcome::Value(1)
+        ));
+        assert_eq!(runtime.pc, 0x1000);
+        assert!(runtime.save_state.snapshots.is_empty());
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
