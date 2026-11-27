@@ -14,7 +14,7 @@ use crate::scene::{
 };
 
 mod shader;
-mod wgpu_backend;
+pub(crate) mod wgpu_backend;
 
 pub use shader::{shader_source, ShaderProgram};
 use wgpu_backend::WgpuBackend;

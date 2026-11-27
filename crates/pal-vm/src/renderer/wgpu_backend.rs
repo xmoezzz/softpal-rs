@@ -12,7 +12,7 @@ use wgpu::util::DeviceExt;
 use winit::dpi::PhysicalSize;
 use winit::window::Window;
 
-use crate::scene::{DrawCommand, FrameScene, SceneTexture, SceneTextureId, SpriteDraw};
+use crate::scene::{DrawCommand, FrameScene, SceneTexture, SceneTextureId, SpriteCrossfade, SpriteDraw};
 
 use super::{
     pal_device_rect_to_clip_quad, scaled_rect, shader_source, RenderOutcome, ShaderProgram,
@@ -211,6 +211,47 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
 }
 "#;
 
+const CROSSFADE_SHADER: &str = r#"
+struct FadeLayer {
+    origin: vec4<f32>,
+    inverse: vec4<f32>,
+    uv: vec4<f32>,
+    color: vec4<f32>,
+};
+
+@group(1) @binding(0) var incoming_texture: texture_2d<f32>;
+@group(1) @binding(1) var incoming_sampler: sampler;
+@group(2) @binding(0) var<uniform> layers: array<FadeLayer, 2>;
+
+fn sample_layer(
+    position: vec2<f32>, layer: FadeLayer, image: texture_2d<f32>, sampling: sampler,
+) -> vec4<f32> {
+    let displacement = position - layer.origin.xy;
+    let local = vec2<f32>(
+        dot(displacement, layer.inverse.xy),
+        dot(displacement, layer.inverse.zw),
+    );
+    let inside = all(local >= vec2<f32>(0.0)) && all(local < vec2<f32>(1.0));
+    let texel = textureSampleLevel(image, sampling, layer.uv.xy + clamp(local, vec2(0.0), vec2(1.0)) * layer.uv.zw, 0.0);
+    let alpha = select(0.0, texel.a * layer.color.a, inside);
+    return vec4<f32>(texel.rgb * layer.color.rgb * alpha, alpha);
+}
+
+@fragment
+fn fs_crossfade(in: VertexOutput) -> @location(0) vec4<f32> {
+    let position = in.clip_position.xy;
+    let old = sample_layer(position, layers[0], sprite_texture, sprite_sampler);
+    let incoming = sample_layer(position, layers[1], incoming_texture, incoming_sampler);
+    let combined = old + incoming;
+    return vec4<f32>(combined.rgb / max(combined.a, 0.000001), combined.a);
+}
+"#;
+
+struct GpuCrossfade {
+    sources: [wgpu::BindGroup; 2],
+    uniforms: wgpu::BindGroup,
+}
+
 struct GpuTexture {
     generation: u64,
     width: u32,
@@ -223,6 +264,7 @@ struct GpuTexture {
 enum SpanBinding {
     Nearest(SceneTextureId),
     Linear(SceneTextureId),
+    Crossfade(usize),
     White,
 }
 
@@ -240,6 +282,8 @@ pub struct WgpuBackend {
     config: wgpu::SurfaceConfiguration,
     pipelines: Vec<wgpu::RenderPipeline>,
     raster_pipelines: Vec<wgpu::RenderPipeline>,
+    crossfade_pipeline: wgpu::RenderPipeline,
+    crossfade_bind_layout: wgpu::BindGroupLayout,
     raster_bind_layout: wgpu::BindGroupLayout,
     sampler_nearest: wgpu::Sampler,
     sampler_linear: wgpu::Sampler,
@@ -248,6 +292,7 @@ pub struct WgpuBackend {
     textures: HashMap<SceneTextureId, GpuTexture>,
     vertex_buffer: wgpu::Buffer,
     vertex_capacity: u64,
+    filter_scaled_sprites: bool,
 }
 
 impl WgpuBackend {
@@ -255,6 +300,31 @@ impl WgpuBackend {
         let instance =
             wgpu::Instance::new(wgpu::InstanceDescriptor::new_with_display_handle_from_env(Box::new(window.clone())));
         let surface = instance.create_surface(window)?;
+        Self::from_surface(instance, surface, size, cfg!(target_os = "macos")).await
+    }
+
+    /// The caller must keep this CAMetalLayer attached and alive for the
+    /// lifetime of the renderer.
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    pub(crate) async unsafe fn from_metal_layer(
+        layer: *mut std::ffi::c_void,
+        size: PhysicalSize<u32>,
+    ) -> anyhow::Result<Self> {
+        let mut descriptor = wgpu::InstanceDescriptor::new_without_display_handle();
+        descriptor.backends = wgpu::Backends::METAL;
+        let instance = wgpu::Instance::new(descriptor);
+        let surface = unsafe {
+            instance.create_surface_unsafe(wgpu::SurfaceTargetUnsafe::CoreAnimationLayer(layer))?
+        };
+        Self::from_surface(instance, surface, size, true).await
+    }
+
+    async fn from_surface(
+        instance: wgpu::Instance,
+        surface: wgpu::Surface<'static>,
+        size: PhysicalSize<u32>,
+        filter_scaled_sprites: bool,
+    ) -> anyhow::Result<Self> {
         let adapter = instance
             .request_adapter(&wgpu::RequestAdapterOptions {
                 apply_limit_buckets: false,
@@ -353,35 +423,65 @@ impl WgpuBackend {
             label: Some("pal sprite shader"),
             source: wgpu::ShaderSource::Wgsl(SPRITE_SHADER.into()),
         });
-        let pipelines = (0..12)
-            .map(|mode| {
-                device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                    label: Some("pal sprite pipeline"),
-                    layout: Some(&pipeline_layout),
-                    vertex: wgpu::VertexState {
-                        module: &shader,
-                        entry_point: Some("vs_main"),
-                        compilation_options: wgpu::PipelineCompilationOptions::default(),
-                        buffers: &[Some(SpriteVertex::LAYOUT)],
-                    },
-                    primitive: wgpu::PrimitiveState::default(),
-                    depth_stencil: None,
-                    multisample: wgpu::MultisampleState::default(),
-                    fragment: Some(wgpu::FragmentState {
-                        module: &shader,
-                        entry_point: Some("fs_main"),
-                        compilation_options: wgpu::PipelineCompilationOptions::default(),
-                        targets: &[Some(wgpu::ColorTargetState {
-                            format,
-                            blend: blend_state(mode),
-                            write_mask: wgpu::ColorWrites::ALL,
-                        })],
-                    }),
-                    multiview_mask: None,
-                    cache: None,
-                })
+        let sprite_pipeline = |layout: &wgpu::PipelineLayout, shader: &wgpu::ShaderModule,
+                               fragment, mode| {
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("pal sprite pipeline"),
+                layout: Some(layout),
+                vertex: wgpu::VertexState {
+                    module: shader,
+                    entry_point: Some("vs_main"),
+                    compilation_options: Default::default(),
+                    buffers: &[Some(SpriteVertex::LAYOUT)],
+                },
+                primitive: Default::default(),
+                depth_stencil: None,
+                multisample: Default::default(),
+                fragment: Some(wgpu::FragmentState {
+                    module: shader,
+                    entry_point: Some(fragment),
+                    compilation_options: Default::default(),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format,
+                        blend: blend_state(mode),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                }),
+                multiview_mask: None,
+                cache: None,
             })
+        };
+        let pipelines = (0..12)
+            .map(|mode| sprite_pipeline(&pipeline_layout, &shader, "fs_main", mode))
             .collect();
+        let crossfade_bind_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("PAL sprite crossfade coordinates"),
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: wgpu::BufferSize::new(128),
+                },
+                count: None,
+            }],
+        });
+        let crossfade_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("PAL sprite crossfade pipeline layout"),
+            bind_group_layouts: &[
+                Some(&texture_bind_layout),
+                Some(&texture_bind_layout),
+                Some(&crossfade_bind_layout),
+            ],
+            immediate_size: 0,
+        });
+        let crossfade_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("PAL sprite crossfade shader"),
+            source: wgpu::ShaderSource::Wgsl(format!("{SPRITE_SHADER}{CROSSFADE_SHADER}").into()),
+        });
+        let crossfade_pipeline =
+            sprite_pipeline(&crossfade_layout, &crossfade_shader, "fs_crossfade", 1);
 
         let raster_bind_layout = raster_bind_layout(&device);
         let raster_pipelines = (0..12)
@@ -453,6 +553,8 @@ impl WgpuBackend {
             config,
             pipelines,
             raster_pipelines,
+            crossfade_pipeline,
+            crossfade_bind_layout,
             raster_bind_layout,
             sampler_nearest,
             sampler_linear,
@@ -461,6 +563,7 @@ impl WgpuBackend {
             textures: HashMap::new(),
             vertex_buffer,
             vertex_capacity,
+            filter_scaled_sprites,
         })
     }
 
@@ -606,10 +709,30 @@ impl WgpuBackend {
         let surface_size = [self.config.width, self.config.height];
         let mut vertices: Vec<SpriteVertex> = Vec::with_capacity(scene.commands.len() * 6);
         let mut spans: Vec<DrawSpan> = Vec::with_capacity(scene.commands.len());
+        let mut crossfades = Vec::with_capacity(scene.sprite_crossfades.len());
         for command in &scene.commands {
             match command {
                 DrawCommand::Sprite(sprite) => {
-                    self.push_sprite(&mut vertices, &mut spans, scale, surface_size, sprite);
+                    if let Some(fade) = scene
+                        .sprite_crossfades
+                        .iter()
+                        .find(|fade| fade.output == sprite.texture_id)
+                    {
+                        if let Some(prepared) = self.prepare_crossfade(fade, scale) {
+                            push_quad_vertices(
+                                &mut vertices,
+                                &mut spans,
+                                SpanBinding::Crossfade(crossfades.len()),
+                                scaled_rect(sprite.dst, scale),
+                                surface_size,
+                                [0.0, 0.0, 1.0, 1.0],
+                                [1.0; 4],
+                            );
+                            crossfades.push(prepared);
+                        }
+                    } else {
+                        self.push_sprite(&mut vertices, &mut spans, scale, surface_size, sprite);
+                    }
                 }
                 DrawCommand::SolidQuad(quad) => {
                     if !quad.dst.is_drawable() {
@@ -706,6 +829,15 @@ impl WgpuBackend {
                         .get(&texture_id)
                         .map(|texture| &texture.bind_linear),
                     SpanBinding::White => Some(&self.white_bind_nearest),
+                    SpanBinding::Crossfade(index) => {
+                        let fade = &crossfades[index];
+                        pass.set_pipeline(&self.crossfade_pipeline);
+                        pass.set_bind_group(0, &fade.sources[0], &[]);
+                        pass.set_bind_group(1, &fade.sources[1], &[]);
+                        pass.set_bind_group(2, &fade.uniforms, &[]);
+                        pass.draw(span.first_vertex..span.first_vertex + 6, 0..1);
+                        continue;
+                    }
                 };
                 let Some(bind_group) = bind_group else {
                     continue;
@@ -723,6 +855,80 @@ impl WgpuBackend {
         self.queue.submit([encoder.finish()]);
         self.queue.present(frame);
         Ok(RenderOutcome::Rendered)
+    }
+
+    fn prepare_crossfade(&self, fade: &SpriteCrossfade, scale: [f32; 2]) -> Option<GpuCrossfade> {
+        let prepare = |sprite: &SpriteDraw| {
+            let texture = self.textures.get(&sprite.texture_id)?;
+            let (smooth, uv) = self.sprite_sampling(sprite, texture, scale);
+            let [origin, right, _, bottom] = sprite.quad(false)
+                .map(|[x, y]| [x * scale[0], y * scale[1]]);
+            let u = [right[0] - origin[0], right[1] - origin[1]];
+            let v = [bottom[0] - origin[0], bottom[1] - origin[1]];
+            let det = u[0] * v[1] - u[1] * v[0];
+            if !det.is_finite() || det.abs() <= f32::EPSILON {
+                return None;
+            }
+            let uniform = [
+                [origin[0], origin[1], 0.0, 0.0],
+                [v[1] / det, -v[0] / det, -u[1] / det, u[0] / det],
+                uv,
+                sprite.effective_blend_state().modulation(sprite.color)
+                    .map(|channel| channel.clamp(0.0, 1.0)),
+            ];
+            let source = if smooth { &texture.bind_linear } else { &texture.bind_nearest };
+            Some((source.clone(), uniform))
+        };
+        let (old_source, old) = prepare(&fade.layers[0])?;
+        let (new_source, new) = prepare(&fade.layers[1])?;
+        let buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("PAL sprite crossfade coordinates"),
+            contents: bytemuck::bytes_of(&[old, new]),
+            usage: wgpu::BufferUsages::UNIFORM,
+        });
+        Some(GpuCrossfade {
+            sources: [old_source, new_source],
+            uniforms: self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("PAL sprite crossfade uniforms"),
+                layout: &self.crossfade_bind_layout,
+                entries: &[wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: buffer.as_entire_binding(),
+                }],
+            }),
+        })
+    }
+
+    fn sprite_sampling(
+        &self,
+        sprite: &SpriteDraw,
+        texture: &GpuTexture,
+        scale: [f32; 2],
+    ) -> (bool, [f32; 4]) {
+        let dst = scaled_rect(sprite.dst, scale);
+        let src_w = sprite.src.w * texture.width as f32;
+        let src_h = sprite.src.h * texture.height as f32;
+        let smooth = sprite.raster_fx.is_none()
+            && if self.filter_scaled_sprites {
+                (dst.w - src_w).abs() > 0.01
+                    || (dst.h - src_h).abs() > 0.01
+                    || sprite.rotation[2].rem_euclid(512.0) != 0.0
+            } else {
+                sprite.smooth_upscale
+                    && (dst.w > src_w * 1.1 || dst.h > src_h * 1.1)
+            };
+        let mut uvs = [sprite.src.x, sprite.src.y, sprite.src.w, sprite.src.h];
+        if smooth && (!self.filter_scaled_sprites || uvs != [0.0, 0.0, 1.0, 1.0]) {
+            // Half-texel inset keeps linear sampling inside the source cell so
+            // neighboring button animation cells do not bleed in.
+            let inset_u = (0.5 / texture.width as f32).min(sprite.src.w * 0.25);
+            let inset_v = (0.5 / texture.height as f32).min(sprite.src.h * 0.25);
+            uvs[0] += inset_u;
+            uvs[1] += inset_v;
+            uvs[2] -= inset_u * 2.0;
+            uvs[3] -= inset_v * 2.0;
+        }
+        (smooth, uvs)
     }
 
     fn push_sprite(
@@ -744,24 +950,7 @@ impl WgpuBackend {
             return;
         };
         let dst_device = scaled_rect(sprite.dst, scale);
-        let src_w = sprite.src.w * texture.width as f32;
-        let src_h = sprite.src.h * texture.height as f32;
-        // Match the software compositor: smooth sampling only kicks in when
-        // the sprite is actually upscaled past its native texel density.
-        let smooth = sprite.raster_fx.is_none()
-            && sprite.smooth_upscale
-            && (dst_device.w > src_w * 1.1 || dst_device.h > src_h * 1.1);
-        let mut uvs = [sprite.src.x, sprite.src.y, sprite.src.w, sprite.src.h];
-        if smooth {
-            // Half-texel inset keeps linear sampling inside the source cell so
-            // neighboring button animation cells do not bleed in.
-            let inset_u = (0.5 / texture.width as f32).min(sprite.src.w * 0.25);
-            let inset_v = (0.5 / texture.height as f32).min(sprite.src.h * 0.25);
-            uvs[0] += inset_u;
-            uvs[1] += inset_v;
-            uvs[2] -= inset_u * 2.0;
-            uvs[3] -= inset_v * 2.0;
-        }
+        let (smooth, uvs) = self.sprite_sampling(sprite, texture, scale);
         let binding = if smooth {
             SpanBinding::Linear(sprite.texture_id)
         } else {

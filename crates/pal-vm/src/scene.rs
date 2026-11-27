@@ -14,6 +14,14 @@ pub struct FrameScene {
     pub textures: Vec<SceneTexture>,
     pub commands: Vec<DrawCommand>,
     pub raster_stage: Option<RasterStage>,
+    pub(crate) sprite_crossfades: Vec<SpriteCrossfade>,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct SpriteCrossfade {
+    pub output: SceneTextureId,
+    pub generation: u64,
+    pub layers: [SpriteDraw; 2],
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -35,6 +43,7 @@ impl FrameScene {
             textures: Vec::new(),
             commands: Vec::new(),
             raster_stage: None,
+            sprite_crossfades: Vec::new(),
         }
     }
 
@@ -59,6 +68,7 @@ impl FrameScene {
             textures: Vec::new(),
             commands: Vec::new(),
             raster_stage: None,
+            sprite_crossfades: Vec::new(),
         }
     }
 
@@ -313,34 +323,31 @@ fn rasterize_scene_rgba_inner(scene: &FrameScene, preserve_alpha: bool) -> Vec<u
     for command in &scene.commands {
         match command {
             DrawCommand::Sprite(sprite) => {
-                if let Some(texture) = scene
-                    .textures
-                    .iter()
-                    .find(|texture| texture.id == sprite.texture_id)
-                {
-                    if sprite.raster_fx.is_some() || sprite.rotation[2].rem_euclid(512.0) != 0.0 {
-                        blit_transformed_sprite(
-                            &mut pixels,
-                            width,
-                            height,
-                            texture,
-                            sprite,
-                            preserve_alpha,
+                let combined = scene.sprite_crossfades.iter()
+                    .find(|fade| fade.output == sprite.texture_id)
+                    .and_then(|fade| {
+                        let texture = |draw: SpriteDraw| {
+                            scene.textures.iter().find(|tex| tex.id == draw.texture_id)
+                        };
+                        let [old, new] = fade.layers;
+                        combine_sprite_transition(
+                            fade.output, fade.generation, width, height,
+                            [(old, texture(old)?), (new, texture(new)?)],
+                        )
+                    });
+                let source = combined.as_ref().map(|(draw, texture)| (draw, texture))
+                    .or_else(|| {
+                        scene.textures.iter().find(|texture| texture.id == sprite.texture_id)
+                            .map(|texture| (sprite, texture))
+                    });
+                if let Some((sprite, texture)) = source {
+                    let blend_state = sprite.effective_blend_state();
+                    visit_sprite_samples(width, height, texture, sprite, |x, y, src| {
+                        blend_pixel_mode(
+                            &mut pixels, width, x, y, src, sprite.render_mode,
+                            blend_state, preserve_alpha,
                         );
-                        continue;
-                    }
-                    blit_sprite(
-                        &mut pixels,
-                        width,
-                        height,
-                        texture,
-                        sprite.dst,
-                        sprite.source_rect,
-                        sprite.color,
-                        sprite.render_mode,
-                        sprite.effective_blend_state(),
-                        preserve_alpha,
-                    );
+                    });
                 }
             }
             DrawCommand::SolidQuad(quad) => {
@@ -358,15 +365,94 @@ fn rasterize_scene_rgba_inner(scene: &FrameScene, preserve_alpha: bool) -> Vec<u
     pixels
 }
 
-/// CPU reference for the GPU quad path, also used by the FFI console hosts.
-/// Barycentric interpolation preserves source-cell UVs through rotation and FX.
-fn blit_transformed_sprite(
-    target: &mut [u8],
+/// Combine both weighted images on transparent pixels so the completed layer
+/// covers the background once, including where the two silhouettes overlap.
+pub(crate) fn combine_sprite_transition(
+    id: SceneTextureId,
+    generation: u64,
+    logical_width: u32,
+    logical_height: u32,
+    layers: [(SpriteDraw, &SceneTexture); 2],
+) -> Option<(SpriteDraw, SceneTexture)> {
+    let dst = crossfade_bounds(layers.map(|(sprite, _)| sprite), logical_width, logical_height)?;
+    let (width, height) = (dst.w as u32, dst.h as u32);
+    let mut pixels = vec![0u8; width as usize * height as usize * 4];
+    for (mut sprite, texture) in layers {
+        sprite.dst.x -= dst.x;
+        sprite.dst.y -= dst.y;
+        visit_sprite_samples(width, height, texture, &sprite, |x, y, src| {
+            let idx = (y as usize * width as usize + x as usize) * 4;
+            let coverage = src[3] / 255.0;
+            for channel in 0..3 {
+                let contribution = (src[channel] * coverage).round() as u8;
+                pixels[idx + channel] = pixels[idx + channel].saturating_add(contribution);
+            }
+            pixels[idx + 3] = pixels[idx + 3].saturating_add(src[3].round() as u8);
+        });
+    }
+    // The ordinary scene texture pipeline takes straight RGBA.
+    for pixel in pixels.chunks_exact_mut(4) {
+        let alpha = u32::from(pixel[3]);
+        if alpha != 0 {
+            for channel in &mut pixel[..3] {
+                *channel = ((u32::from(*channel) * 255 + alpha / 2) / alpha).min(255) as u8;
+            }
+        }
+    }
+    let texture = SceneTexture::rgba8(id, generation, width, height, pixels);
+    let mut draw = SpriteDraw::full_frame(&texture, width, height);
+    draw.dst = dst;
+    draw.priority = layers[1].0.priority;
+    Some((draw, texture))
+}
+
+pub(crate) fn crossfade_bounds(
+    layers: [SpriteDraw; 2],
+    logical_width: u32,
+    logical_height: u32,
+) -> Option<RectF> {
+    let corners = layers.iter().flat_map(|sprite| sprite.quad(true));
+    let (min, max) = corners.fold(
+        ([f32::INFINITY; 2], [f32::NEG_INFINITY; 2]),
+        |(min, max), point| {
+            (
+                std::array::from_fn(|i| min[i].min(point[i])),
+                std::array::from_fn(|i| max[i].max(point[i])),
+            )
+        },
+    );
+    let limit = [logical_width as f32, logical_height as f32];
+    let start = std::array::from_fn::<_, 2, _>(|i| min[i].floor().clamp(0.0, limit[i]) as u32);
+    let end = std::array::from_fn::<_, 2, _>(|i| max[i].ceil().clamp(0.0, limit[i]) as u32);
+    let [width, height] = std::array::from_fn(|i| end[i].saturating_sub(start[i]));
+    if width == 0 || height == 0 {
+        return None;
+    }
+    Some(RectF::new(start[0] as f32, start[1] as f32, width as f32, height as f32))
+}
+
+fn visit_sprite_samples(
     width: u32,
     height: u32,
     texture: &SceneTexture,
     sprite: &SpriteDraw,
-    preserve_alpha: bool,
+    write: impl FnMut(u32, u32, [f32; 4]),
+) {
+    if sprite.raster_fx.is_some() || sprite.rotation[2].rem_euclid(512.0) != 0.0 {
+        visit_transformed_sprite_samples(width, height, texture, sprite, write);
+    } else {
+        visit_axis_aligned_sprite_samples(width, height, texture, sprite, write);
+    }
+}
+
+/// CPU reference for the GPU quad path, also used by the FFI console hosts.
+/// Barycentric interpolation preserves source-cell UVs through rotation and FX.
+fn visit_transformed_sprite_samples(
+    width: u32,
+    height: u32,
+    texture: &SceneTexture,
+    sprite: &SpriteDraw,
+    mut write: impl FnMut(u32, u32, [f32; 4]),
 ) {
     let corners = sprite.quad(true);
     let min_x = corners
@@ -399,6 +485,7 @@ fn blit_transformed_sprite(
         [sprite.src.x + sprite.src.w, sprite.src.y + sprite.src.h],
         [sprite.src.x, sprite.src.y + sprite.src.h],
     ];
+    let color = sprite.effective_blend_state().modulation(sprite.color);
     for y in min_y..max_y {
         for x in min_x..max_x {
             let point = [x as f32 + 0.5, y as f32 + 0.5];
@@ -437,37 +524,24 @@ fn blit_transformed_sprite(
                 .floor()
                 .clamp(0.0, texture.height.saturating_sub(1) as f32) as usize;
             let index = (sy * texture.width as usize + sx) * 4;
-            let color = sprite.effective_blend_state().modulation(sprite.color);
             let src = std::array::from_fn(|i| {
                 texture.pixels[index + i] as f32 * color[i].clamp(0.0, 1.0)
             });
-            blend_pixel_mode(
-                target,
-                width,
-                x,
-                y,
-                src,
-                sprite.render_mode,
-                sprite.effective_blend_state(),
-                preserve_alpha,
-            );
+            write(x, y, src);
         }
     }
 }
 
-fn blit_sprite(
-    target: &mut [u8],
+fn visit_axis_aligned_sprite_samples(
     target_width: u32,
     target_height: u32,
     texture: &SceneTexture,
-    dst: RectF,
-    source_rect: [i32; 4],
-    color: [f32; 4],
-    render_mode: u32,
-    blend_state: blend::NativeDrawState,
-    preserve_alpha: bool,
+    sprite: &SpriteDraw,
+    mut write: impl FnMut(u32, u32, [f32; 4]),
 ) {
-    let color = blend_state.modulation(color);
+    let color = sprite.effective_blend_state().modulation(sprite.color);
+    let dst = sprite.dst;
+    let source_rect = sprite.source_rect;
     let x0 = dst.x.floor().max(0.0) as i32;
     let y0 = dst.y.floor().max(0.0) as i32;
     let x1 = (dst.x + dst.w).ceil().min(target_width as f32) as i32;
@@ -496,16 +570,7 @@ fn blit_sprite(
                 texture.pixels[src_idx + 2] as f32 * color[2].clamp(0.0, 1.0),
                 texture.pixels[src_idx + 3] as f32 * color[3].clamp(0.0, 1.0),
             ];
-            blend_pixel_mode(
-                target,
-                target_width,
-                x as u32,
-                y as u32,
-                src,
-                render_mode,
-                blend_state,
-                preserve_alpha,
-            );
+            write(x as u32, y as u32, src);
         }
     }
 }

@@ -91,6 +91,8 @@ void *sena_ios_create(
     const char *game_root_utf8,
     const char *nls_utf8,
     const char *lang_utf8);
+/* Borrow a live CAMetalLayer on the main thread. Keep it alive until host destruction. */
+int32_t sena_ios_attach_metal_layer(void *handle, void *layer, uint32_t width, uint32_t height);
 void sena_ios_resize_viewport(
     void *handle,
     uint32_t surface_width,

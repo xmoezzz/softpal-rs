@@ -405,15 +405,6 @@ impl PalFontSystem {
             })
     }
 
-    fn fallback_scale(&self) -> f32 {
-        let size = f32::from(self.layout_font_size());
-        if self.profile == PalFontProfile::LocalizedReference {
-            (size * 1.5).trunc()
-        } else {
-            size
-        }
-    }
-
     fn native_baseline(&self) -> i32 {
         self.bitmap("").map_or_else(
             || {

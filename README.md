@@ -35,6 +35,15 @@ controls, artifacts, and validation limits. Console hardware has not been tested
 cargo run -p pal-vm --release --bin sena -- /path/to/game --nls sjis
 ```
 
+For a Simplified Chinese release with localized archives, add `--lang cn`.
+In the macOS launcher, choose **Simplified Chinese** under **Game Language**
+when importing the game or from the existing game's **…** menu. Keep **NLS**
+set to **ShiftJIS** for the official Simplified Chinese release of Koikake.
+
+On iOS, choose **Game Language → Simplified Chinese** from the game's **…**
+menu. On Android, long-press an imported game and choose **Language: 简体中文**.
+Set **NLS** to **ShiftJIS** for this release on either platform.
+
 ## Claims
 <p align="center">
   <img src="icon/crysirror.svg" width="160" height="160" alt="CrySirror logo">

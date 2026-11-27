@@ -221,7 +221,9 @@ final class LauncherHost {
     func runGame(_ game: GameEntry) -> Int32 {
         return game.rootPath.withCString { gameC in
             game.nls.withCString { nlsC in
-                sena_run_entry_nls(gameC, nlsC, nil)
+                game.language.rawValue.withCString { langC in
+                    sena_run_entry_nls(gameC, nlsC, langC)
+                }
             }
         }
     }
@@ -250,7 +252,7 @@ struct SenaLauncherMain {
             return
         }
 
-        print("[launcher] -> sena_run_entry_nls(game_root=\(game.rootPath), nls=\(game.nls)); NSApp.isRunning=\(NSApp.isRunning)")
+        print("[launcher] -> sena_run_entry_nls(game_root=\(game.rootPath), nls=\(game.nls), lang=\(game.language.rawValue)); NSApp.isRunning=\(NSApp.isRunning)")
         let rc = host.runGame(game)
         print("[launcher] <- sena_run_entry returned \(rc); exiting process")
 

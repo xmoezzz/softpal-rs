@@ -694,6 +694,7 @@ struct GameButtonEntry {
 
 #[derive(Clone, Debug, Default)]
 struct GameButtonGroup {
+    adv_voice_index: Option<i32>,
     normal_image: i32,
     hover_image: i32,
     onmouse_index: i32,
@@ -1102,7 +1103,7 @@ const SAVE_SPRITE_CAP: usize = 128;
 const SAVE_SPRITE_BYTES_CAP: usize = 8 * 1024 * 1024;
 const SAVE_MEMDAT_CAP: usize = 65_536;
 const SAVE_NAME_CAP: usize = 256;
-const PORTABLE_SAVE_VERSION: u32 = 16;
+const PORTABLE_SAVE_VERSION: u32 = 17;
 const CHECKPOINT_SPRITE_BYTES_CAP: usize = 256 * 1024 * 1024;
 /// BGM slots are a handful in practice; cap the serialized list regardless.
 const SAVE_BGM_TRACK_CAP: usize = 64;
@@ -1162,6 +1163,7 @@ struct SavedButton {
 #[derive(Clone, Debug)]
 struct SavedButtonGroup {
     group: i32,
+    adv_voice_index: Option<i32>,
     normal_image: i32,
     hover_image: i32,
     onmouse_index: i32,
@@ -1225,6 +1227,7 @@ struct RuntimeSaveSnapshot {
     history_texts: Vec<Option<FrozenHistoryText>>,
     text_args: [i32; 4],
     text_base: i32,
+    text_button_group: i32,
     text_mode: i32,
     /// ADV window alpha (category 2 index 11). The script re-establishes it
     /// whenever a scene or background changes, so a save restored mid-scene
@@ -2432,6 +2435,8 @@ impl ScriptRuntime {
             self.text_state.dirty = false;
             self.text_state.presented_frame = None;
             rebuilt = true;
+            let voice = self.text_voice_value();
+            self.sync_adv_voice_button(voice != 0 && voice != 0x0FFF_FFFF, sprites);
             self.sync_adv_name_sprite(&name, sprites);
         }
         self.apply_pending_text_alpha_actions(sprites);
@@ -2522,8 +2527,8 @@ impl ScriptRuntime {
     ) {
         let saved_size = self.font_state.font_size();
         let saved_color = self.font_state.color();
-        let native_text_size = self.text_state.init_font_size().max(1) as u16;
-        self.font_state.set_font_size(native_text_size.max(22));
+        let native_text_size = self.text_state.init_font_size().clamp(1, i32::from(u16::MAX)) as u16;
+        self.font_state.set_font_size(native_text_size);
         self.font_state.set_color(
             self.text_state.text_color,
             self.text_state.text_effect_color,
@@ -2587,10 +2592,13 @@ impl ScriptRuntime {
             558
         };
         let text_origin_x = text_draw_x.saturating_sub(x).max(0) as u32;
-        // PAL leaves one line-gap above the ADV glyph cell. The bitmap font's
-        // tallest glyphs start at row zero, so omitting this leading makes the
-        // line sit visibly higher than the original renderer.
-        let text_leading = (u32::from(native_text_size) / 4).max(1);
+        // Keep the legacy bitmap leading. The localized TrueType cell
+        // already includes the space above the glyph at its own baseline.
+        let text_leading = if self.font_state.profile() == PalFontProfile::LocalizedReference {
+            0
+        } else {
+            (u32::from(native_text_size) / 4).max(1)
+        };
         let text_origin_y =
             (text_draw_y.saturating_sub(y).max(0) as u32).saturating_add(text_leading);
         let min_width = self.text_state.init_text_width().max(760) as u32;
@@ -2640,8 +2648,10 @@ impl ScriptRuntime {
         }
         let saved_size = self.font_state.font_size();
         let saved_color = self.font_state.color();
-        self.font_state.set_font_size(22);
-        let (name, _) = parse_pal_text_directives(name);
+        let (name, temporary_size) = parse_pal_text_directives(name);
+        let native_size = self.text_state.init_font_size().clamp(1, i32::from(u16::MAX)) as u16;
+        self.font_state.set_font_size(temporary_size.unwrap_or(native_size));
+        self.font_state.set_color(self.text_state.text_color, self.text_state.text_effect_color);
         let (name_width, name_height, name_rgba) = self.font_state.rasterize(&name);
         self.font_state.set_font_size(saved_size);
         self.font_state.set_color(saved_color.0, saved_color.1);
@@ -2651,45 +2661,36 @@ impl ScriptRuntime {
             Some(cache) => (cache.sprite_x, cache.sprite_y),
             None => return,
         };
-        let native_text_size = self.text_state.init_font_size().max(1) as u16;
-        let text_leading = (u32::from(native_text_size) / 4).max(1);
         let name_x = if self.text_state.init_name_x() != 0 {
             self.text_state.init_name_x()
         } else {
             x + 18
         };
-        let name_y = if self.text_state.init_name_y() != 0 {
+        let default_name_y = if self.text_state.init_name_y() != 0 {
             self.text_state.init_name_y()
         } else {
             y.saturating_sub(name_surface_height as i32 + 8)
         }
-        .saturating_add(text_leading as i32);
-        // The native name text is painted over the nameplate/VOICE button
-        // surface. Anchor the synthetic sprite just above whichever visible
-        // ADV chrome button sits under the name origin, so popup screens and
-        // their lanes still cover the name when the text window is hidden.
-        let name_z = self
-            .game_buttons
-            .iter()
-            .filter(|((group, _), entry)| *group == 0 && entry.visible)
-            .filter_map(|(_, entry)| {
-                let sprite = sprites.get(entry.handle)?;
-                if !sprite.visible {
-                    return None;
-                }
-                let pos = sprite.effective_position();
-                let right = pos.x.saturating_add(sprite.source_rect.width());
-                let bottom = pos.y.saturating_add(sprite.source_rect.height());
-                let center_x = name_x.saturating_add(name_surface_width as i32 / 2);
-                let center_y = name_y.saturating_add(name_surface_height as i32 / 2);
-                (center_x >= pos.x && center_x < right && center_y >= pos.y && center_y < bottom)
-                    .then(|| sprite.effective_priority())
+        .saturating_add(i32::from(self.text_state.init_mode() != 1) * 2);
+        // Center the painted glyphs inside the registered plate cell. The
+        // raster's transparent ascent and descent padding is face-dependent.
+        let nameplate = self
+            .adv_voice_button_key()
+            .and_then(|key| self.game_buttons.get(&key))
+            .and_then(|entry| sprites.get(entry.handle));
+        let name_y = nameplate
+            .and_then(|plate| {
+                centered_adv_name_y(
+                    &name_rgba,
+                    name_surface_width,
+                    plate.effective_position().y,
+                    plate.source_rect.height(),
+                )
             })
-            .max()
-            .map(|priority| priority.saturating_add(1))
-            .unwrap_or_else(|| {
-                adv_text_render_priority(self.sprite_priority_cursor).saturating_add(1)
-            });
+            .unwrap_or(default_name_y);
+        let name_z = nameplate
+            .map(|sprite| sprite.effective_priority().saturating_add(1))
+            .unwrap_or_else(|| adv_text_render_priority(self.sprite_priority_cursor).saturating_add(1));
         let position_z = 0;
         if let Some(handle) = self.text_state.name_sprite {
             let _ = sprites.replace_sprite_surface(
@@ -2754,6 +2755,28 @@ impl ScriptRuntime {
         None
     }
 
+    fn adv_voice_button_key(&self) -> Option<(i32, i32)> {
+        let group = self.text_state.button;
+        if let Some(index) = self.button_groups.get(&group).and_then(|entry| entry.adv_voice_index) {
+            return self.game_buttons.contains_key(&(group, index)).then_some((group, index));
+        }
+        // Older portable saves contain the button resource but no role table.
+        self.game_buttons.iter().find_map(|(&key, entry)| {
+            (key.0 == group && entry.name.eq_ignore_ascii_case("MAIN_BTN_VOICE")).then_some(key)
+        })
+    }
+
+    fn sync_adv_voice_button(&mut self, has_voice: bool, sprites: &mut SpriteSystem) {
+        let Some(key) = self.adv_voice_button_key() else { return };
+        let Some(entry) = self.game_buttons.get_mut(&key) else { return };
+        let row = if has_voice { 0 } else { 3 };
+        if entry.toggle != row || entry.enabled != has_voice {
+            entry.toggle = row;
+            entry.enabled = has_voice;
+            sprites.rect_set_pos(entry.handle, 0, row);
+        }
+    }
+
     fn sync_adv_button_chrome_visibility(&mut self, sprites: &mut SpriteSystem) {
         let chrome_visible = self.text_state.initialized
             && self.text_state.visible
@@ -2780,8 +2803,14 @@ impl ScriptRuntime {
             .filter_map(|(_, entry)| sprites.get(entry.handle).map(|sprite| sprite.color.alpha()))
             .max()
             .unwrap_or(0);
-        for ((group, _), entry) in self.game_buttons.iter() {
-            if *group != 0 {
+        let voice_button = self.adv_voice_button_key();
+        for (&key @ (group, _), entry) in &self.game_buttons {
+            if Some(key) == voice_button {
+                let show_plate = self.text_state.name_sprite.is_some() || entry.enabled;
+                sprites.view_ctrl(entry.handle, chrome_visible && entry.visible && show_plate);
+                continue;
+            }
+            if group != 0 {
                 continue;
             }
             // A paired compact/expanded base defines an ADV menu. Keep its
@@ -3153,12 +3182,13 @@ impl ScriptRuntime {
     fn try_play_text_voice(
         &mut self,
         voice_value: i32,
+        looping: bool,
         assets: &CoreAssets,
         nls: Nls,
         mut resource_manager: Option<&mut ResourceManager>,
         mut audio: Option<&mut AudioSystem>,
     ) {
-        if voice_value == 0x0FFF_FFFF || !self.text_state.voice_enabled {
+        if matches!(voice_value, 0 | 0x0FFF_FFFF) || !self.text_state.voice_enabled {
             log::debug!(
                 "[trace-audio] text_voice skip value=0x{voice_value:08X} enabled={}",
                 self.text_state.voice_enabled
@@ -3178,8 +3208,8 @@ impl ScriptRuntime {
             log::debug!("[trace-audio] text_voice skip name={name:?}");
             return;
         }
-        // Game.exe 0x43C2C0 releases all eight ADV voice lanes before a
-        // new line, including every member of the previous MIX.
+        // Starting or replaying ADV voice replaces all eight voice lanes,
+        // including every member of the previous MIX.
         if let Some(audio) = audio.as_deref_mut() {
             self.release_adv_voice_slots(audio);
         }
@@ -3188,22 +3218,18 @@ impl ScriptRuntime {
             .and_then(|rm| self.voice_unit_slot_for_name(rm, &name))
             .map(|slot| self.voice_unit_channel_percent(slot))
             .unwrap_or(100);
-        let outcome = self.audio_load_and_play(
-            13,
+        let loaded = self.load_voice_audio(
             0,
             PalSoundGroup::GROUP1,
-            voice_value,
-            0,
+            &name,
+            i32::from(looping),
             unit_percent,
             true,
-            None,
-            assets,
-            nls,
+            0,
             resource_manager,
             audio,
-            0,
         );
-        log::debug!("[trace-audio] text_voice name={name:?} outcome={outcome:?}");
+        log::debug!("[trace-audio] text_voice name={name:?} loaded={loaded} looping={looping}");
     }
 
     fn ensure_wait_mark_sheet(&mut self, resource_manager: &mut ResourceManager) {
@@ -6285,7 +6311,7 @@ impl ScriptRuntime {
                 self.text_state.visible = true;
                 self.text_state.dirty = true;
                 self.push_history_text_record(ordered, assets, nls);
-                self.try_play_text_voice(ordered[3], assets, nls, resource_manager, audio);
+                self.try_play_text_voice(ordered[3], false, assets, nls, resource_manager, audio);
                 let reveal_ms = self.text_state.reveal_duration_ms;
                 log::debug!("[trace-text] text args={ordered:?} reveal_ms={}", reveal_ms);
                 // Game.exe AdvCommandText updates the text context, sets the
@@ -6392,9 +6418,20 @@ impl ScriptRuntime {
             }
             12 => {
                 let args = self.pop_ext_args(1);
-                let voice_value = args.first().copied().unwrap_or(0);
-                self.text_state.last_text_value = voice_value;
-                self.try_play_text_voice(voice_value, assets, nls, resource_manager, audio);
+                if !self.text_state.initialized {
+                    return ExtCallOutcome::Value(0);
+                }
+                // The replay operand selects looping for the current ADV
+                // voice. It does not address the text or resource table.
+                let looping = args.first().copied().unwrap_or(0) != 0;
+                self.try_play_text_voice(
+                    self.text_voice_value(),
+                    looping,
+                    assets,
+                    nls,
+                    resource_manager,
+                    audio,
+                );
                 ExtCallOutcome::Value(1)
             }
             13 => {
@@ -6432,7 +6469,7 @@ impl ScriptRuntime {
                 self.text_state.visible = true;
                 self.text_state.dirty = true;
                 self.push_history_text_record(ordered, assets, nls);
-                self.try_play_text_voice(ordered[3], assets, nls, resource_manager, audio);
+                self.try_play_text_voice(ordered[3], false, assets, nls, resource_manager, audio);
                 let reveal_ms = self.text_state.reveal_duration_ms;
                 log::debug!(
                     "[trace-text] text_wait index={index} args={ordered:?} reveal_ms={}",
@@ -6844,7 +6881,7 @@ impl ScriptRuntime {
         assets: &CoreAssets,
         nls: Nls,
         mut resource_manager: Option<&mut ResourceManager>,
-        mut sprites: Option<&mut SpriteSystem>,
+        sprites: Option<&mut SpriteSystem>,
     ) -> ExtCallOutcome {
         match index {
             0 => {
@@ -6921,28 +6958,12 @@ impl ScriptRuntime {
                     .and_then(|manager| read_runtime_save_snapshot(manager.root(), slot).ok())
                     .or_else(|| self.save_state.snapshots.get(&slot).cloned());
                 if let Some(snapshot) = snapshot {
-                    let scene = snapshot.clone();
-                    let resume_wait_click = snapshot.resume_wait_click;
-                    self.restore_save_snapshot(snapshot);
-                    if let Some(sprites) = sprites.as_deref_mut() {
-                        self.restore_checkpoint_scene(&scene, sprites);
-                    }
-                    self.wait_task_handle = None;
-                    self.wait_task_kind = None;
-                    self.save_state.last_result = 1;
                     log::debug!(
                         "[trace-save] load slot={slot} pc=0x{:08X} sprites={}",
-                        self.pc,
-                        scene.sprites.len()
+                        snapshot.pc,
+                        snapshot.sprites.len()
                     );
-                    return if resume_wait_click {
-                        ExtCallOutcome::Wait {
-                            value: 1,
-                            request: WaitRequest::Click,
-                        }
-                    } else {
-                        ExtCallOutcome::Value(1)
-                    };
+                    return self.restore_game_save(snapshot, sprites);
                 }
                 // Exact audited Koikake saves restore native scene records.
                 // Other profiles retain the historical header-only fallback.
@@ -6950,23 +6971,12 @@ impl ScriptRuntime {
                     .as_deref_mut()
                     .and_then(|manager| self.import_original_save_with_resources(manager, slot, assets))
                 {
-                    let resume_pc = snapshot.pc;
-                    let resume_wait_click = snapshot.resume_wait_click;
                     self.save_state.snapshots.insert(slot, snapshot.clone());
-                    let scene = snapshot.clone();
-                    self.restore_save_snapshot(snapshot);
-                    if let Some(sprites) = sprites.as_deref_mut() {
-                        self.restore_checkpoint_scene(&scene, sprites);
-                    }
-                    self.wait_task_handle = None;
-                    self.wait_task_kind = None;
-                    self.save_state.last_result = 1;
                     log::debug!(
-                        "[trace-save] load slot={slot} imported original save, resume pc=0x{resume_pc:08X}"
+                        "[trace-save] load slot={slot} imported original save, resume pc=0x{:08X}",
+                        snapshot.pc
                     );
-                    return if resume_wait_click {
-                        ExtCallOutcome::Wait { value: 1, request: WaitRequest::Click }
-                    } else { ExtCallOutcome::Value(1) };
+                    return self.restore_game_save(snapshot, sprites);
                 }
                 let has_file = resource_manager
                     .as_ref()
@@ -7395,27 +7405,28 @@ impl ScriptRuntime {
         let save_slot = args[1];
         let x = args[2];
         let y = args[3];
-        let prefix = resource_manager
-            .as_deref()
-            .and_then(|manager| read_original_save_prefix(manager.root(), save_slot).ok())
-            .or_else(|| {
-                (self.save_state.last_slot == save_slot
-                    && !self.save_state.thumbnail_pixels.is_empty())
-                .then(|| self.current_save_prefix(save_slot))
-            });
-        let Some(prefix) = prefix else {
-            log::debug!("[trace-save] thumbnail_set slot={slot} save_slot={save_slot} missing");
-            return ExtCallOutcome::Value(1);
-        };
         let Some(sprites) = sprites else {
             return ExtCallOutcome::Value(1);
         };
         if let Some(old) = self.save_state.thumbnail_sprites.remove(&(slot, x, y)) {
             sprites.release(old);
         }
-        let width = prefix.thumb_width.max(1) as u32;
-        let height = prefix.thumb_height.max(1) as u32;
-        let mut pixels = prefix.pixels;
+        let thumbnail = resource_manager
+            .as_deref()
+            .and_then(|manager| read_original_save_prefix(manager.root(), save_slot).ok())
+            .map(|prefix| (prefix.thumb_width, prefix.thumb_height, prefix.pixels))
+            .or_else(|| {
+                let snapshot = self.save_state.snapshots.get(&save_slot)?;
+                (!snapshot.thumb_pixels.is_empty()).then(|| {
+                    (snapshot.thumb_width, snapshot.thumb_height, snapshot.thumb_pixels.clone())
+                })
+            });
+        let Some((width, height, mut pixels)) = thumbnail else {
+            log::debug!("[trace-save] thumbnail_set slot={slot} save_slot={save_slot} missing");
+            return ExtCallOutcome::Value(1);
+        };
+        let width = width.max(1) as u32;
+        let height = height.max(1) as u32;
         let expected = width as usize * height as usize * 4;
         if pixels.len() != expected {
             pixels.resize(expected, 0);
@@ -9090,6 +9101,7 @@ impl ScriptRuntime {
         self.button_groups.insert(
             group,
             GameButtonGroup {
+                adv_voice_index: None,
                 normal_image,
                 hover_image,
                 onmouse_index: 0,
@@ -9679,39 +9691,26 @@ impl ScriptRuntime {
         let mode = args[0];
         let index = args[1];
         let state = args[2];
-        if mode == 0 {
-            match index {
-                // MAIN_BTN_SKIP/AUTO are registered as compact sprite buttons; the
-                // expansion call selects their visual row/state after the script
-                // has made the base controls transparent.
-                0 | 1 => {
-                    for entry in self.matching_button_entries_mut(0, index) {
-                        entry.toggle = state;
-                    }
-                    if let Some(sprites) = sprites {
-                        for handle in self.matching_button_handles(0, index) {
-                            sprites.rect_set_pos(handle, 0, state);
-                        }
-                    }
+        if state == 2 {
+            // Registers the group control updated by ADV when a voiced line
+            // is submitted. PalButtonCtrl changes input, not sprite visibility.
+            self.button_groups.entry(mode).or_default().adv_voice_index = Some(index);
+            self.text_state.dirty = true;
+        } else if state == 4 && self.font_state.profile() == PalFontProfile::LocalizedReference {
+            // The localized wrapper assigns native depth 0x1306.
+            if let Some(sprites) = sprites {
+                for handle in self.matching_button_handles(mode, index) {
+                    sprites.set_priority(handle, -0x1306);
                 }
-                // MAIN_BTN_VOICE is a wide pop-out strip. State 2/4 in the normal
-                // ADV setup means it is registered for later use but not drawn as
-                // the default text-window chrome.
-                14 => {
-                    for entry in self.matching_button_entries_mut(0, 14) {
-                        entry.enabled = false;
-                        entry.alpha = 0;
-                    }
-                    if let Some(sprites) = sprites {
-                        for handle in self.matching_button_handles(0, 14) {
-                            sprites.view_ctrl(handle, false);
-                            if let Some(sprite) = sprites.get_mut(handle) {
-                                sprite.color = PalColor::from_argb(sprite.color.0 & 0x00FF_FFFF);
-                            }
-                        }
-                    }
+            }
+        } else if mode == 0 && matches!((index, state), (0, 1) | (1, 3)) {
+            for entry in self.matching_button_entries_mut(0, index) {
+                entry.toggle = state;
+            }
+            if let Some(sprites) = sprites {
+                for handle in self.matching_button_handles(0, index) {
+                    sprites.rect_set_pos(handle, 0, state);
                 }
-                _ => {}
             }
         }
         log::debug!(
@@ -13008,6 +13007,7 @@ impl ScriptRuntime {
             history_texts: self.history_state.texts.clone(),
             text_args: self.text_state.last_text_args,
             text_base: self.text_state.base,
+            text_button_group: self.text_state.button,
             text_mode: self.text_state.mode,
             text_alpha: Some(self.text_state.alpha),
             text_visible: self.text_state.visible,
@@ -13096,6 +13096,7 @@ impl ScriptRuntime {
                 .iter()
                 .map(|(&group, entry)| SavedButtonGroup {
                     group,
+                    adv_voice_index: entry.adv_voice_index,
                     normal_image: entry.normal_image,
                     hover_image: entry.hover_image,
                     onmouse_index: entry.onmouse_index,
@@ -13122,7 +13123,9 @@ impl ScriptRuntime {
     fn capture_sprite_records(&self, sprites: &SpriteSystem) -> Vec<SavedSprite> {
         let mut records = Vec::new();
         for (&slot, &handle) in &self.game_sprites {
-            if let Some(record) = saved_sprite_from_handle(sprites, slot, handle) {
+            if let Some(record) =
+                saved_sprite_with_limit(sprites, slot, handle, CHECKPOINT_SPRITE_BYTES_CAP)
+            {
                 records.push(record);
             }
             if records.len() >= SAVE_SPRITE_CAP {
@@ -13246,6 +13249,34 @@ impl ScriptRuntime {
         Some(snapshot)
     }
 
+    fn restore_game_save(
+        &mut self,
+        snapshot: RuntimeSaveSnapshot,
+        sprites: Option<&mut SpriteSystem>,
+    ) -> ExtCallOutcome {
+        let resume_wait_click = snapshot.resume_wait_click;
+        self.restore_save_snapshot(snapshot.clone());
+        if let Some(sprites) = sprites {
+            self.restore_checkpoint_scene(&snapshot, sprites);
+        }
+        // A load can happen before the first savepoint (from the title menu)
+        // or replace a different story branch's existing checkpoint.
+        self.save_state.armed = true;
+        self.save_state.checkpoint = Some(snapshot);
+        self.save_state.resume_checkpoint = None;
+        self.wait_task_handle = None;
+        self.wait_task_kind = None;
+        self.save_state.last_result = 1;
+        if resume_wait_click {
+            ExtCallOutcome::Wait {
+                value: 1,
+                request: WaitRequest::Click,
+            }
+        } else {
+            ExtCallOutcome::Value(1)
+        }
+    }
+
     fn restore_save_snapshot(&mut self, snapshot: RuntimeSaveSnapshot) {
         self.history_navigation.target = None;
         if let Some((strings, cursor)) = snapshot.dynamic_strings {
@@ -13270,6 +13301,7 @@ impl ScriptRuntime {
         self.text_state.last_text_args = snapshot.text_args;
         self.text_state.last_text_value = snapshot.text_args[1];
         self.text_state.base = snapshot.text_base;
+        self.text_state.button = snapshot.text_button_group;
         self.text_state.mode = snapshot.text_mode;
         // The script hides and re-shows the ADV window when a scene or
         // background changes (`text_window_set_alpha` around `text_set_base`),
@@ -13376,6 +13408,7 @@ impl ScriptRuntime {
             self.button_groups.insert(
                 group.group,
                 GameButtonGroup {
+                    adv_voice_index: group.adv_voice_index,
                     normal_image: group.normal_image,
                     hover_image: group.hover_image,
                     onmouse_index: group.onmouse_index,
@@ -16555,6 +16588,7 @@ fn encode_runtime_save_snapshot(snapshot: &RuntimeSaveSnapshot) -> std::io::Resu
         write_u32(&mut bytes, group.lock_started_ms)?;
         write_u32(&mut bytes, group.lock_duration_ms)?;
         write_i32(&mut bytes, group.raw_toggle)?;
+        write_i32(&mut bytes, group.adv_voice_index.unwrap_or(i32::MIN))?;
     }
     bytes.write_all(&[u8::from(snapshot.resume_wait_click)])?;
     write_u32(
@@ -16580,6 +16614,7 @@ fn encode_runtime_save_snapshot(snapshot: &RuntimeSaveSnapshot) -> std::io::Resu
     ui_snapshot::write(&mut bytes, snapshot.ui.as_ref())?;
     ui_snapshot::write_strings(&mut bytes, snapshot.dynamic_strings.as_ref())?;
     host_checkpoint::write(&mut bytes,snapshot.host_checkpoint.as_ref())?;
+    write_i32(&mut bytes, snapshot.text_button_group)?;
     Ok(bytes)
 }
 
@@ -16757,6 +16792,12 @@ fn decode_runtime_save_snapshot(reader: &mut impl Read) -> std::io::Result<Runti
                 lock_started_ms: if version >= 12 { read_u32_from(reader)? } else { 0 },
                 lock_duration_ms: if version >= 12 { read_u32_from(reader)? } else { 0 },
                 raw_toggle: if version >= 14 { read_i32_from(reader)? } else { 0 },
+                adv_voice_index: if version >= 17 {
+                    let index = read_i32_from(reader)?;
+                    (index != i32::MIN).then_some(index)
+                } else {
+                    None
+                },
             });
         }
         if version >= 3 {
@@ -16813,6 +16854,7 @@ fn decode_runtime_save_snapshot(reader: &mut impl Read) -> std::io::Result<Runti
         }
     }
     if version>=16 { snapshot.host_checkpoint=host_checkpoint::read(reader)?; }
+    if version >= 17 { snapshot.text_button_group = read_i32_from(reader)?; }
     Ok(snapshot)
 }
 
@@ -17188,14 +17230,6 @@ fn install_i32_words(dst: &mut Vec<i32>, src: &[i32], min_len: usize) {
     }
 }
 
-fn saved_sprite_from_handle(
-    sprites: &SpriteSystem,
-    slot: i32,
-    handle: SpriteHandle,
-) -> Option<SavedSprite> {
-    saved_sprite_with_limit(sprites, slot, handle, SAVE_SPRITE_BYTES_CAP)
-}
-
 fn saved_sprite_with_limit(sprites: &SpriteSystem, slot: i32, handle: SpriteHandle,
     limit: usize) -> Option<SavedSprite> {
     let sprite = sprites.get(handle)?;
@@ -17391,6 +17425,18 @@ fn format_save_day(modified: SystemTime, format_mode: i32) -> String {
     }
     let week = ["日", "月", "火", "水", "木", "金", "土"][local.weekday as usize % 7];
     format!("{date} ({week})")
+}
+
+fn centered_adv_name_y(rgba: &[u8], width: u32, plate_y: i32, plate_height: i32) -> Option<i32> {
+    if plate_height <= 0 {
+        return None;
+    }
+    let stride = (width as usize).checked_mul(4)?.max(4);
+    let has_ink = |row: &[u8]| row.chunks_exact(4).any(|pixel| pixel[3] != 0);
+    let top = rgba.chunks_exact(stride).position(has_ink)? as i32;
+    let bottom = rgba.chunks_exact(stride).rposition(has_ink)? as i32 + 1;
+    let top_padding = (plate_height - (bottom - top)).div_euclid(2);
+    Some(plate_y.saturating_add(top_padding).saturating_sub(top))
 }
 
 fn parse_pal_text_directives(text: &str) -> (String, Option<u16>) {
@@ -18717,6 +18763,91 @@ mod tests {
     }
 
     #[test]
+    fn adv_name_is_centered_by_ink_instead_of_transparent_font_padding() {
+        let mut rgba = [0; 4 * 12];
+        for row in 6..10 {
+            rgba[4 * row + 3] = 255;
+        }
+        let y = centered_adv_name_y(&rgba, 1, 100, 20).unwrap();
+        assert_eq!((y + 6, y + 10), (108, 112));
+        assert_eq!(centered_adv_name_y(&[0; 48], 1, 100, 20), None);
+        assert_eq!(centered_adv_name_y(&rgba, 1, 100, 0), None);
+    }
+
+    #[test]
+    fn adv_voice_plate_renders_without_enabling_voice_and_survives_save() {
+        let mut runtime = ScriptRuntime::boot(0, ScriptRuntimeConfig::default());
+        let mut sprites = SpriteSystem::new();
+        let plate = sprites
+            .create_rgba_sprite(4, 16, vec![255; 4 * 16 * 4], PalVec3::default(), 0, "plate")
+            .unwrap();
+        sprites.set_offset_rect(plate, 4, 4);
+        runtime.text_state.initialized = true;
+        runtime.text_state.visible = true;
+        runtime.text_state.button = 3;
+        let body = sprites
+            .create_rgba_sprite(1, 1, vec![255; 4], PalVec3::default(), 0, "adv:text")
+            .unwrap();
+        runtime.text_state.sprite = Some(body);
+        runtime.text_state.name_sprite = Some(body);
+        runtime.game_buttons.insert((3, 7), GameButtonEntry {
+            registration_order: 0,
+            native_flags: 1,
+            hover_callbacks: [None; 2],
+            handle: plate,
+            name: "plate".into(),
+            visible: true,
+            enabled: true,
+            locked: false,
+            toggle: 0,
+            alpha: 255,
+            slider_offset: 0,
+            base_position: [0; 2],
+            slider_position: [0; 2],
+            hit_rect: None,
+            gosub_point: None,
+            anim_resource: None,
+            anim_play_flag: 0,
+        });
+        runtime.stack.extend_from_slice(&[2, 7, 3]);
+        assert!(matches!(runtime.ext_btn_expansion(Some(&mut sprites)), ExtCallOutcome::Value(1)));
+
+        runtime.sync_adv_voice_button(false, &mut sprites);
+        runtime.sync_adv_button_chrome_visibility(&mut sprites);
+        assert!(sprites.get(plate).unwrap().visible);
+        assert!(!runtime.game_buttons[&(3, 7)].enabled);
+        assert_eq!(sprites.get(plate).unwrap().source_rect.top, 12);
+
+        runtime.text_state.name_sprite = None;
+        runtime.sync_adv_button_chrome_visibility(&mut sprites);
+        assert!(!sprites.get(plate).unwrap().visible);
+
+        runtime.sync_adv_voice_button(true, &mut sprites);
+        runtime.sync_adv_button_chrome_visibility(&mut sprites);
+        assert!(sprites.get(plate).unwrap().visible);
+        assert!(runtime.game_buttons[&(3, 7)].enabled);
+        assert_eq!(sprites.get(plate).unwrap().source_rect.top, 0);
+
+        let old_name = sprites
+            .create_rgba_sprite(1, 1, vec![255; 4], PalVec3::new(0, 24, 0), 0, "old name")
+            .unwrap();
+        runtime.text_state.name_sprite = Some(old_name);
+        let snapshot = runtime.capture_resumable_scene(Some(&sprites));
+        let encoded = encode_runtime_save_snapshot(&snapshot).unwrap();
+        let restored = decode_runtime_save_snapshot(&mut encoded.as_slice()).unwrap();
+        runtime.restore_save_snapshot(restored.clone());
+        runtime.restore_checkpoint_scene(&restored, &mut sprites);
+        assert_eq!(runtime.adv_voice_button_key(), Some((3, 7)));
+
+        let name = sprites
+            .create_rgba_sprite(1, 1, vec![255; 4], PalVec3::new(0, 2, 0), 0, "rebuilt name")
+            .unwrap();
+        runtime.text_state.name_sprite = Some(name);
+        runtime.advance_actions(&mut sprites);
+        assert_eq!(sprites.get(name).unwrap().effective_position().y, 2);
+    }
+
+    #[test]
     fn inline_quick_buttons_follow_toolbar_alpha() {
         let mut runtime = ScriptRuntime::boot(0, ScriptRuntimeConfig::default());
         let mut sprites = SpriteSystem::new();
@@ -19228,12 +19359,34 @@ mod tests {
         // A following ordinary ADV line releases every member of the chorus.
         let (assets, _) = empty_core_assets(false);
         let voice = runtime.store_dynamic_string("speaker0_line.wav".into());
-        runtime.try_play_text_voice(voice, &assets, Nls::ShiftJis,
+        runtime.try_play_text_voice(voice, false, &assets, Nls::ShiftJis,
             Some(&mut resources), Some(&mut audio));
         assert_eq!(runtime.game_audio.len(), 2);
         assert!(runtime.game_audio.contains_key(&(13, 0)));
         assert_eq!(runtime.game_audio[&(13, 8)], independent);
         assert_eq!(audio.loaded_channel_count(PalSoundGroup::GROUP1), 2);
+
+        // The replay callback supplies a loop flag. The voice comes from the
+        // saved ADV arguments and the displayed line stays parked.
+        runtime.text_state.initialized = true;
+        runtime.text_state.last_text_args = [0, 1234, 0, voice];
+        runtime.text_state.last_text_value = 1234;
+        let snapshot = runtime.capture_save_snapshot();
+        runtime.restore_save_snapshot(snapshot);
+        let prior_voice = runtime.game_audio[&(13, 0)];
+        audio.set_channel_volume(prior_voice, PalVolume::from_raw(1000)).unwrap();
+        runtime.stack.extend_from_slice(&[77, 0]);
+        assert!(matches!(
+            runtime.dispatch_text_stub(
+                12, &assets, Nls::ShiftJis, Some(&mut resources), Some(&mut audio),
+            ),
+            ExtCallOutcome::Value(1)
+        ));
+        assert_eq!(runtime.stack, [77]);
+        assert_eq!(runtime.text_state.last_text_value, 1234);
+        assert_eq!(runtime.text_voice_value(), voice);
+        assert_eq!(audio.channel_volume(runtime.game_audio[&(13, 0)]).unwrap().raw(), 2500);
+
         // voice_stop(-1) uses the same map and releases the complete group.
         runtime.stack = vec![0, -1];
         runtime.ext_audio_stop(13, PalSoundGroup::GROUP1, Some(&mut audio));
@@ -19433,7 +19586,7 @@ mod tests {
         assert_eq!(audio.channel_volume(handle).unwrap().raw(), 4000);
         assert_eq!(audio.effective_volume(handle).unwrap().raw(), 2000);
         let voice = vm.store_dynamic_string("vo02_line".into());
-        vm.try_play_text_voice(voice, &assets, Nls::ShiftJis, Some(&mut resources), Some(&mut audio));
+        vm.try_play_text_voice(voice, false, &assets, Nls::ShiftJis, Some(&mut resources), Some(&mut audio));
         assert_eq!(audio.channel_volume(vm.game_audio[&(13, 0)]).unwrap().raw(), 4000);
         vm.replay_history_voice("unknown", Some(&mut resources), Some(&mut audio));
         assert_eq!(audio.channel_volume(vm.game_audio[&(13, 0)]).unwrap().raw(), 1500);
@@ -19810,6 +19963,43 @@ mod tests {
     }
 
     #[test]
+    fn game_save_restores_large_sprite_and_rearms_checkpoint() {
+        let mut runtime = ScriptRuntime::boot(0x1000, ScriptRuntimeConfig::default());
+        let mut sprites = SpriteSystem::new();
+        let (width, height) = (1248, 3072);
+        let rgba = Arc::new(vec![255; width as usize * height as usize * 4]);
+        let handle = sprites
+            .create_shared_rgba_sprite(
+                width,
+                height,
+                rgba.clone(),
+                PalVec3::new(336, -1992, 0),
+                12,
+                "large-sprite",
+            )
+            .unwrap();
+        runtime.game_sprites.insert(12, handle);
+        let mut saved = runtime.capture_resumable_scene(Some(&sprites));
+        assert_eq!(saved.sprites.len(), 1);
+        saved.resume_wait_click = true;
+
+        let bytes = encode_runtime_save_snapshot(&saved).unwrap();
+        let snapshot = decode_runtime_save_snapshot(&mut bytes.as_slice()).unwrap();
+        let mut restarted = ScriptRuntime::boot(0x2000, ScriptRuntimeConfig::default());
+        let mut scene = SpriteSystem::new();
+        assert!(matches!(
+            restarted.restore_game_save(snapshot, Some(&mut scene)),
+            ExtCallOutcome::Wait { request: WaitRequest::Click, .. }
+        ));
+        let sprite = scene.get(restarted.game_sprites[&12]).unwrap();
+        let texture = scene.surface(sprite.surface).unwrap().to_scene_texture();
+        assert_eq!((texture.width, texture.height), (width, height));
+        assert_eq!(texture.pixels.as_slice(), rgba.as_slice());
+        assert!(restarted.save_state.armed);
+        assert_eq!(restarted.resumable_save_snapshot().unwrap().pc, saved.pc);
+    }
+
+    #[test]
     fn save_page_keeps_all_slot_thumbnails_and_clears_them_on_refresh() {
         let root = std::env::temp_dir().join(format!(
             "sena_rs_save_page_{}_{}",
@@ -19864,6 +20054,12 @@ mod tests {
                 ExtCallOutcome::Value(1)
             ));
         }
+        // A preceding slot query can set last_slot even for an empty slot.
+        // The current screen capture is only for the next save operation.
+        runtime.save_state.last_slot = 11;
+        runtime.save_state.thumbnail_pixels = vec![255; 16];
+        runtime.stack.extend_from_slice(&[20, 390, 11, 77]);
+        runtime.ext_thumbnail_set(Some(&mut manager), Some(&mut sprites));
         assert_eq!(runtime.save_state.thumbnail_sprites.len(), 2);
         assert!(runtime
             .save_state

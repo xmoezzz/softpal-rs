@@ -314,6 +314,15 @@ impl PalFontSystem {
         }
     }
 
+    fn fallback_scale(&self) -> f32 {
+        let size = f32::from(self.layout_font_size());
+        if self.profile == PalFontProfile::LocalizedReference {
+            (size * 1.5).trunc()
+        } else {
+            size
+        }
+    }
+
     /// Logical layout size, excluding PalFontGetSize's outer padding. The ADV
     /// layout uses this contract; native callers use `native_size` instead.
     pub fn measure(&self, text: &str) -> (u32, u32) {
@@ -352,8 +361,8 @@ impl PalFontSystem {
             }
             return (width.max(line).max(0) as u32, height.max(0) as u32);
         }
-        let size = f32::from(font_size);
-        let mut height = u32::from(font_size);
+        let size = self.fallback_scale();
+        let mut height = size as u32;
         let mut width = 0;
         for line in text.split(['\r', '\n']) {
             width = width.max(self.fallback.measure_line(line, size).0);
@@ -444,11 +453,12 @@ impl PalFontSystem {
                 }
             }
         } else if font_size != 0 {
+            let size = self.fallback_scale();
             let mut y = 0_i32;
             for line in text.split(['\r', '\n']) {
                 let (source_width, source_height, source) =
                     self.fallback
-                        .rasterize_line(line, f32::from(font_size), [255; 4]);
+                        .rasterize_line(line, size, [255; 4]);
                 // ab_glyph is a portable face substitute, not GDI. Quantize its
                 // coverage into PAL's six-bit input before using native kernels.
                 let coverage: Vec<_> = source
@@ -469,7 +479,7 @@ impl PalFontSystem {
                     self.effect,
                     self.profile,
                 );
-                y = y.wrapping_add(i32::from(font_size));
+                y = y.wrapping_add(size as i32);
             }
         }
         Ok((width, height, pixels))
@@ -782,6 +792,21 @@ mod tests {
         assert_eq!(font.measure("A").1, 16);
         font.end();
         assert_eq!(font.choose_bitmap(), Some(2));
+    }
+
+    #[test]
+    fn localized_plain_text_uses_the_native_face_height_for_layout_and_pixels() {
+        let mut font = PalFontSystem::new();
+        font.set_font_size(42);
+        let ordinary = font.measure("PAL");
+        font.set_profile(PalFontProfile::LocalizedReference);
+        let (width, height) = font.measure("PAL");
+        assert_eq!(height, 63);
+        assert!(width > ordinary.0);
+        let (raster_width, raster_height, pixels) = font.rasterize("PAL");
+        assert_eq!((raster_width, raster_height), (width + 2, height + 2));
+        assert!(pixels.chunks_exact(4).any(|pixel| pixel[3] != 0));
+        assert_eq!(font.measure("PAL\nPAL"), (width, 126));
     }
 
     #[test]

@@ -160,6 +160,11 @@ impl ScriptRuntime {
                 // Text textures are rebuilt by the font system on load.
                 let mut base = binding.base;
                 base.texture_size = sprite.texture_size;
+                if kind == 3 && self.adv_voice_button_key().is_some() {
+                    // Keep the name layout calculated from the current glyphs
+                    // and plate. Saved action lanes are rebound separately.
+                    base.position.y = sprite.position.y;
+                }
                 sprite.set_info(base);
                 sprite.action_lanes = SpriteActionLanes::default();
             } else if kind >= 2 {

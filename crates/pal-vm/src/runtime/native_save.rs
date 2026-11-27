@@ -172,6 +172,7 @@ impl NativeImage {
             let group_data = r.words(4)?;
             groups.push(SavedButtonGroup {
                 group,
+                adv_voice_index: None,
                 normal_image: images[0],
                 hover_image: images[1],
                 onmouse_index: -1,
