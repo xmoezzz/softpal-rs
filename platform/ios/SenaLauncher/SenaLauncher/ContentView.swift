@@ -126,16 +126,31 @@ struct GameTileView: View {
 
                 Spacer()
 
-                Menu(NlsChoice.normalized(game.nls).label) {
-                    ForEach(NlsChoice.allCases) { choice in
-                        Button(choice.label) {
-                            library.updateNls(game: game, nls: choice)
+                Menu {
+                    Picker("Game Language", selection: Binding(
+                        get: { game.language },
+                        set: { library.updateLanguage(game: game, language: $0) }
+                    )) {
+                        ForEach(GameLanguage.allCases) { language in
+                            Text(language.label).tag(language)
+                        }
+                    }
+                    Divider()
+                    Picker("NLS", selection: Binding(
+                        get: { NlsChoice.normalized(game.nls) },
+                        set: { library.updateNls(game: game, nls: $0) }
+                    )) {
+                        ForEach(NlsChoice.allCases) { choice in
+                            Text(choice.label).tag(choice)
                         }
                     }
                     Divider()
                     Button("Remove") {
                         library.remove(game: game)
                     }
+                } label: {
+                    Image(systemName: "ellipsis.circle")
+                        .accessibilityLabel("Game Settings")
                 }
             }
         }

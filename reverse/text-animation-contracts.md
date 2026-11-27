@@ -75,6 +75,48 @@ which would expose the frame-array pointer for Ex; the portable typed API
 intentionally returns None there. Untyped misuse of native task payloads is not
 reproduced by safe Rust enums.
 
+## Localized ADV sizing and nameplate
+
+The official Simplified Chinese FHD pair uses Game.exe SHA-256
+`219395e636f8fb8eb1bc7790345b0de5294671b33f8542edf074b333b0722e8e`
+and PAL.dll SHA-256
+`64d6c81c13c39e45a410da61a6cb49241f020e5f15ac20ad58b08a6448294e23`.
+In that Game.exe, the name draw at `0x43DA66` and the body draw recorded in
+`evidence/runtime-audit/sub_43D770.c` use the same configured text size. The
+archived INI and a portable boot trace both show size 42. PAL's
+`PalFontBegin` at `0x100AAA30` passes height 63 and width 42 to GDI at
+`0x100AAB42` for that size.
+
+The VM button expansion switch at `0x40E237` registers the voice control with
+selector 2. Selector 4 assigns the referenced sprite native depth `0x1306`.
+The ADV voice path at `0x43EBA3` updates the control through `PalButtonCtrl`
+and sets the sprite cell to row 0 with a voice or row 3 without one.
+`PalButtonCtrl` controls input independently of sprite visibility. The shipped
+button sheet contains the visible nameplate in both rows, with the voice symbol
+absent in row 3.
+
+Portable plain-text measurement and rasterization now share the localized face
+height already used by the encoded glyph path. The speaker uses the configured
+ADV size. The registered voice button also provides the nameplate, with
+its own input and row state. Portable save version 17 retains the group
+selection and voice button role. Legacy Koikake saves can recover the role
+from their saved button resource name. Native GDI raster and font-weight
+matching remain outside the portable face implementation.
+
+### ADV voice replay
+
+In the same Simplified Chinese FHD executable, category 2 index 12 points to
+`0x43EE20` through the table at `0x4BB490`. The handler pops one 32-bit word,
+returns 0 if ADV text is uninitialized, and otherwise releases the eight ADV
+voice lanes. It passes the stored voice filename at `ctx+0x2200` to
+`0x442C10` with the popped word normalized to the loop flag, then returns 1.
+The ordinary ADV voice path populates that filename at `0x43C4AC`. The
+game's VOICE callback passes 0 for a single replay.
+
+The portable VM resolves the current ADV line's voice argument, which is also
+available on the restored line, and routes playback through the shared ADV
+voice loader. Replaying leaves the dialogue arguments and wait intact.
+
 ## Font profile differences
 
 Koikake has one active bitmap font. Totsulover caches 44-byte entries by exact,

@@ -15,6 +15,14 @@ private func sena_ios_create(
     _ langUtf8: UnsafePointer<CChar>?
 ) -> UnsafeMutableRawPointer?
 
+@_silgen_name("sena_ios_attach_metal_layer")
+private func sena_ios_attach_metal_layer(
+    _ handle: UnsafeMutableRawPointer?,
+    _ layer: UnsafeMutableRawPointer,
+    _ widthPx: UInt32,
+    _ heightPx: UInt32
+) -> Int32
+
 @_silgen_name("sena_ios_step")
 private func sena_ios_step(_ handle: UnsafeMutableRawPointer?, _ dtMs: UInt32) -> Int32
 
@@ -105,7 +113,7 @@ func sena_ios_messagebox_callback(
 // MARK: - Metal-backed UIView for wgpu
 
 final class SenaMetalView: UIView {
-    override class var layerClass: AnyClass { CALayer.self }
+    let metalLayer = CAMetalLayer()
 
     // phase: 0 began, 1 moved, 2 ended, 3 cancelled
     var onTouch: ((Int32, Double, Double) -> Void)?
@@ -115,6 +123,11 @@ final class SenaMetalView: UIView {
         backgroundColor = .black
         isUserInteractionEnabled = true
         isMultipleTouchEnabled = false
+        metalLayer.isHidden = true
+        layer.addSublayer(metalLayer)
+        layer.contentsGravity = .resizeAspect
+        layer.minificationFilter = .linear
+        layer.magnificationFilter = .linear
     }
 
     required init?(coder: NSCoder) {
@@ -128,10 +141,14 @@ final class SenaMetalView: UIView {
     func configureScale(_ scale: CGFloat) {
         contentScaleFactor = scale
         layer.contentsScale = scale
+        metalLayer.contentsScale = scale
     }
 
-    func configureDrawableSize(_ size: CGSize) {
-        _ = size
+    func placeMetalLayer(in viewport: CGRect) {
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        metalLayer.frame = viewport
+        CATransaction.commit()
     }
 
     private func send(_ phase: Int32, _ touches: Set<UITouch>) {
@@ -151,6 +168,7 @@ final class SenaMetalView: UIView {
 final class SenaPlayerViewController: UIViewController {
     private let gameRoot: String
     private let nls: String
+    private let language: GameLanguage
     private let onExit: () -> Void
 
     private var metalView: SenaMetalView { view as! SenaMetalView }
@@ -166,9 +184,10 @@ final class SenaPlayerViewController: UIViewController {
     private var viewportPx: (UInt32, UInt32, UInt32, UInt32) = (0, 0, 1, 1)
     private var viewportPoints: CGRect = CGRect(x: 0, y: 0, width: 1, height: 1)
 
-    init(gameRoot: String, nls: String, onExit: @escaping () -> Void) {
+    init(gameRoot: String, nls: String, language: GameLanguage, onExit: @escaping () -> Void) {
         self.gameRoot = gameRoot
         self.nls = NlsChoice.normalized(nls).rawValue
+        self.language = language
         self.onExit = onExit
         super.init(nibName: nil, bundle: nil)
         modalPresentationStyle = .fullScreen
@@ -206,7 +225,6 @@ final class SenaPlayerViewController: UIViewController {
 
         let wPx = UInt32(max(1.0, (sizePoints.width * scale).rounded(.toNearestOrAwayFromZero)))
         let hPx = UInt32(max(1.0, (sizePoints.height * scale).rounded(.toNearestOrAwayFromZero)))
-        metalView.configureDrawableSize(CGSize(width: CGFloat(wPx), height: CGFloat(hPx)))
         recomputeViewport(wPx: wPx, hPx: hPx, scale: scale, reason: "layout")
 
         if handle == nil {
@@ -250,24 +268,29 @@ final class SenaPlayerViewController: UIViewController {
     private func createEngineIfNeeded(wPx: UInt32, hPx: UInt32, scale: Double) {
         let viewPtr = UnsafeMutableRawPointer(Unmanaged.passUnretained(metalView).toOpaque())
 
-        gameRoot.withCString { gameC in
+        let hnd = gameRoot.withCString { gameC in
             nls.withCString { nlsC in
-                let hnd = sena_ios_create(viewPtr, wPx, hPx, scale, gameC, nlsC, nil)
-                self.handle = hnd
-                if hnd != nil {
-                    var lw: UInt32 = 1280
-                    var lh: UInt32 = 720
-                    sena_ios_logical_size(hnd, &lw, &lh)
-                    self.logicalSize = (max(1, lw), max(1, lh))
-                    self.recomputeViewport(wPx: wPx, hPx: hPx, scale: scale, reason: "create")
-                    sena_ios_resize_viewport(hnd, wPx, hPx, self.viewportPx.0, self.viewportPx.1, self.viewportPx.2, self.viewportPx.3)
-                    let userData = UnsafeMutableRawPointer(Unmanaged.passUnretained(self).toOpaque())
-                    sena_ios_set_native_messagebox_callback(hnd, sena_ios_messagebox_callback, userData)
+                language.rawValue.withCString { langC in
+                    sena_ios_create(viewPtr, wPx, hPx, scale, gameC, nlsC, langC)
                 }
-                self.lastDrawableSizePx = (wPx, hPx)
-                self.lastScale = scale
             }
         }
+        self.handle = hnd
+        if hnd != nil {
+            var lw: UInt32 = 1280
+            var lh: UInt32 = 720
+            sena_ios_logical_size(hnd, &lw, &lh)
+            self.logicalSize = (max(1, lw), max(1, lh))
+            self.recomputeViewport(wPx: wPx, hPx: hPx, scale: scale, reason: "create")
+            sena_ios_resize_viewport(hnd, wPx, hPx, self.viewportPx.0, self.viewportPx.1, self.viewportPx.2, self.viewportPx.3)
+            let metalLayer = Unmanaged.passUnretained(metalView.metalLayer).toOpaque()
+            let attached = sena_ios_attach_metal_layer(hnd, metalLayer, viewportPx.2, viewportPx.3)
+            metalView.metalLayer.isHidden = attached == 0
+            let userData = UnsafeMutableRawPointer(Unmanaged.passUnretained(self).toOpaque())
+            sena_ios_set_native_messagebox_callback(hnd, sena_ios_messagebox_callback, userData)
+        }
+        self.lastDrawableSizePx = (wPx, hPx)
+        self.lastScale = scale
 
         if handle == nil {
             onExit()
@@ -291,6 +314,7 @@ final class SenaPlayerViewController: UIViewController {
             width: CGFloat(Double(vw) / max(scale, 1.0)),
             height: CGFloat(Double(vh) / max(scale, 1.0))
         )
+        metalView.placeMetalLayer(in: viewportPoints)
         logViewport(reason: reason, wPx: wPx, hPx: hPx, scale: scale)
     }
 
@@ -309,7 +333,7 @@ final class SenaPlayerViewController: UIViewController {
     private func logViewport(reason: String, wPx: UInt32, hPx: UInt32, scale: Double) {
         let orientation = view.window?.windowScene?.interfaceOrientation.rawValue ?? -1
         let insets = view.safeAreaInsets
-        let drawable = (metalView.layer as? CAMetalLayer)?.drawableSize ?? .zero
+        let drawable = metalView.metalLayer.drawableSize
         print(
             "[SENA_IOS_VIEWPORT] swift reason=\(reason) bounds_points=\(view.bounds.width)x\(view.bounds.height) " +
             "screen_scale=\(scale) drawable_px=\(wPx)x\(hPx) layer_drawable=\(drawable.width)x\(drawable.height) " +
@@ -382,12 +406,15 @@ final class SenaPlayerViewController: UIViewController {
             bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.last.rawValue),
             provider: provider,
             decode: nil,
-            shouldInterpolate: false,
+            shouldInterpolate: true,
             intent: .defaultIntent
         ) else { return }
 
-        metalView.layer.contentsGravity = .resizeAspect
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        metalView.metalLayer.isHidden = true
         metalView.layer.contents = image
+        CATransaction.commit()
         lastFrameGeneration = generation
     }
 
@@ -455,10 +482,11 @@ final class SenaPlayerViewController: UIViewController {
 struct SenaPlayerContainer: UIViewControllerRepresentable {
     let gameRoot: String
     let nls: String
+    let language: GameLanguage
     let onExit: () -> Void
 
     func makeUIViewController(context: Context) -> SenaPlayerViewController {
-        SenaPlayerViewController(gameRoot: gameRoot, nls: nls, onExit: onExit)
+        SenaPlayerViewController(gameRoot: gameRoot, nls: nls, language: language, onExit: onExit)
     }
 
     func updateUIViewController(_ uiViewController: SenaPlayerViewController, context: Context) {
@@ -474,6 +502,7 @@ struct SenaPlayerScreen: View {
         SenaPlayerContainer(
             gameRoot: game.rootPath,
             nls: game.nls,
+            language: game.language,
             onExit: {
                 DispatchQueue.main.async {
                     library.activeGame = nil

@@ -9,7 +9,8 @@ mod target_render;
 
 use crate::msprite::MSpriteHandle;
 use crate::scene::{
-    DrawCommand, RectF, SceneTexture, SceneTextureFormat, SceneTextureId, SpriteDraw,
+    combine_sprite_transition, crossfade_bounds, DrawCommand, FrameScene, RectF, SceneTexture,
+    SceneTextureFormat, SceneTextureId, SpriteCrossfade, SpriteDraw,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
@@ -483,9 +484,24 @@ impl SpriteSystem {
         }
     }
 
-    pub fn transition_commands(&self) -> Vec<DrawCommand> {
+    pub fn transition_commands(
+        &self,
+        scene: &mut FrameScene,
+        frame_index: u64,
+        shake: [i32; 2],
+    ) -> Vec<DrawCommand> {
+        self.compose_transitions(scene, frame_index, shake, false)
+    }
+
+    pub(crate) fn compose_transitions(
+        &self,
+        scene: &mut FrameScene,
+        frame_index: u64,
+        shake: [i32; 2],
+        defer_compositing: bool,
+    ) -> Vec<DrawCommand> {
         let mut commands = Vec::new();
-        for transition in self.transitions.values() {
+        for (handle, transition) in &self.transitions {
             if transition.state == 0 || transition.transition_id != 1 {
                 continue;
             }
@@ -512,26 +528,77 @@ impl SpriteSystem {
                 (f32::from(second.map_or(0, |sprite| sprite.color.alpha())) * (1.0 - progress))
                     as u8
             };
-            if let Some(second) = second {
-                if transition.duration_ms != 0 {
-                    if let Some(mut command) = second.draw_command_transition(self) {
-                        if let DrawCommand::Sprite(ref mut sprite) = command {
-                            sprite.priority = priority;
-                            sprite.color[3] = f32::from(outgoing_alpha) / 255.0;
+            let fading_draw = |sprite: &PalSprite, alpha: u8| {
+                let Some(DrawCommand::Sprite(mut draw)) = sprite.draw_command_transition(self) else {
+                    return None;
+                };
+                draw.priority = priority;
+                draw.dst.x += shake[0] as f32;
+                draw.dst.y += shake[1] as f32;
+                draw.color[3] = f32::from(alpha) / 255.0;
+                Some(draw)
+            };
+            let outgoing = second
+                .filter(|_| transition.duration_ms != 0)
+                .and_then(|sprite| fading_draw(sprite, outgoing_alpha));
+            let incoming = first.and_then(|sprite| fading_draw(sprite, incoming_alpha));
+            if let (Some(old), Some(new)) = (outgoing, incoming) {
+                // Standard alpha transitions use one intermediate layer.
+                // Drawing each weighted image directly with source-over
+                // applies the background contribution twice.
+                if matches!(old.render_mode, 0 | 1) && matches!(new.render_mode, 0 | 1) {
+                    if incoming_alpha == 0 || outgoing_alpha == 0 {
+                        let visible = if incoming_alpha == 0 { old } else { new };
+                        commands.push(DrawCommand::Sprite(visible));
+                        continue;
+                    }
+                    let old_texture = self
+                        .surface(SpriteSurfaceId(old.texture_id.0))
+                        .map(SpriteSurface::to_scene_texture);
+                    let new_texture = self
+                        .surface(SpriteSurfaceId(new.texture_id.0))
+                        .map(SpriteSurface::to_scene_texture);
+                    if let (Some(old_texture), Some(new_texture)) = (old_texture, new_texture) {
+                        // Keep transient IDs distinct from arena surfaces and
+                        // reserved full-frame effect textures.
+                        let texture_id = SceneTextureId(u64::MAX - 0x100 - u64::from(handle.0));
+                        if defer_compositing {
+                            let layers = [old, new];
+                            if let Some(dst) = crossfade_bounds(
+                                layers, scene.logical_width, scene.logical_height,
+                            ) {
+                                let mut draw = new;
+                                draw.texture_id = texture_id;
+                                draw.dst = dst;
+                                draw.src = RectF::new(0.0, 0.0, 1.0, 1.0);
+                                draw.source_rect = [0, 0, dst.w as i32, dst.h as i32];
+                                draw.rotation = [0.0; 3];
+                                draw.color = [1.0; 4];
+                                draw.raster_fx = None;
+                                scene.sprite_crossfades.push(SpriteCrossfade {
+                                    output: texture_id, generation: frame_index, layers,
+                                });
+                                commands.push(DrawCommand::Sprite(draw));
+                            }
+                            continue;
                         }
-                        commands.push(command);
+                        if let Some((draw, texture)) = combine_sprite_transition(
+                            texture_id,
+                            frame_index,
+                            scene.logical_width,
+                            scene.logical_height,
+                            [(old, &old_texture), (new, &new_texture)],
+                        ) {
+                            scene.textures.push(texture);
+                            commands.push(DrawCommand::Sprite(draw));
+                        }
+                        continue;
                     }
                 }
             }
-            if let Some(first) = first {
-                if let Some(mut command) = first.draw_command_transition(self) {
-                    if let DrawCommand::Sprite(ref mut sprite) = command {
-                        sprite.priority = priority;
-                        sprite.color[3] = f32::from(incoming_alpha) / 255.0;
-                    }
-                    commands.push(command);
-                }
-            }
+            commands.extend(
+                outgoing.into_iter().chain(incoming).map(DrawCommand::Sprite),
+            );
         }
         commands
     }

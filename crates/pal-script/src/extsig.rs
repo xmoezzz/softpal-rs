@@ -424,6 +424,15 @@ static SIG_TEXT_GET_TIME: ExtSig = sig!(2, 10, "text_get_time", pop=0,
     status=Verified, decompiler=Verified,
     evidence=[Disassembly:"koikake.exe 0x4296F0 returns [TaskData+0x20]; SYSTEM page computes slider as 100-speed"],
     game="0x004296F0");
+
+static SIG_TEXT_VOICE_PLAY: ExtSig = sig!(2, 12, "text_voice_play", pop=1,
+    params=["loop":0=Flag=>"zero for one playback; any nonzero word for looping"],
+    return=Status, effects=[StopsSound, CreatesSound, PlaysSound],
+    purpose="Replay the current ADV voice.",
+    status=Verified, decompiler=Verified,
+    evidence=[Disassembly:"Simplified Chinese FHD Game.exe 0x43EE20 releases ADV voice lanes and calls the voice loader with ctx+0x2200 and the normalized loop flag"],
+    game="0x0043EE20");
+
 /// category 2 index 14: text_set_icon_animation_time
 ///
 /// Purpose: Set the animation time for one of the four ADV text-window icon
@@ -4938,6 +4947,7 @@ pub fn lookup_sig(category: u16, index: u16) -> Option<&'static ExtSig> {
         (2, 8) => Some(&SIG_TEXT_CLEAR),
         (2, 9) => Some(&SIG_TEXT_SET_SPEED),
         (2, 10) => Some(&SIG_TEXT_GET_TIME),
+        (2, 12) => Some(&SIG_TEXT_VOICE_PLAY),
         (2, 13) => Some(&SIG_TEXT_TASK_REDRAW_FLAG),
         (2, 14) => Some(&SIG_TEXT_SET_ICON_ANIMATION_TIME),
         (2, 15) => Some(&SIG_TEXT_W),
@@ -5235,6 +5245,7 @@ static ALL_SIGNATURES: &[&ExtSig] = &[
     &SIG_TEXT_CLEAR,
     &SIG_TEXT_SET_SPEED,
     &SIG_TEXT_GET_TIME,
+    &SIG_TEXT_VOICE_PLAY,
     &SIG_TEXT_TASK_REDRAW_FLAG,
     &SIG_TEXT_SET_ICON_ANIMATION_TIME,
     &SIG_TEXT_W,

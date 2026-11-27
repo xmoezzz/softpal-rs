@@ -32,7 +32,7 @@ struct ContentView: View {
             )
         }
         .sheet(item: $library.pendingImport) { p in
-            ImportNlsSheet(pending: p)
+            ImportGameSheet(pending: p)
         }
     }
 
@@ -59,10 +59,13 @@ struct ContentView: View {
     }
 }
 
-struct ImportNlsSheet: View {
+struct ImportGameSheet: View {
     @EnvironmentObject var library: GameLibrary
-    let pending: PendingImport
-    @State private var selectedNls: NlsChoice = .shiftJis
+    @State private var pending: PendingImport
+
+    init(pending: PendingImport) {
+        _pending = State(initialValue: pending)
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -73,12 +76,18 @@ struct ImportNlsSheet: View {
                 .font(.subheadline)
                 .foregroundColor(.secondary)
 
-            Picker("NLS", selection: $selectedNls) {
+            Picker("NLS", selection: $pending.nls) {
                 ForEach(NlsChoice.allCases) { choice in
                     Text(choice.label).tag(choice)
                 }
             }
             .pickerStyle(.segmented)
+
+            Picker("Game Language", selection: $pending.language) {
+                ForEach(GameLanguage.allCases) { language in
+                    Text(language.label).tag(language)
+                }
+            }
 
             HStack {
                 Spacer()
@@ -86,9 +95,7 @@ struct ImportNlsSheet: View {
                     library.pendingImport = nil
                 }
                 Button("Import") {
-                    var updated = pending
-                    updated.nls = selectedNls
-                    library.commitImport(p: updated)
+                    library.commitImport(p: pending)
                 }
                 .keyboardShortcut(.defaultAction)
             }
@@ -134,7 +141,7 @@ struct GameTileView: View {
                 .foregroundColor(.secondary)
                 .lineLimit(1)
 
-            Text(NlsChoice.normalized(game.nls).label)
+            Text("\(NlsChoice.normalized(game.nls).label) · \(game.language.label)")
                 .font(.caption2)
                 .foregroundColor(.secondary)
 
@@ -147,6 +154,14 @@ struct GameTileView: View {
                 Spacer()
 
                 Menu {
+                    Picker("Game Language", selection: Binding(
+                        get: { game.language },
+                        set: { library.updateLanguage(game: game, language: $0) }
+                    )) {
+                        ForEach(GameLanguage.allCases) { language in
+                            Text(language.label).tag(language)
+                        }
+                    }
                     Picker("NLS", selection: Binding(
                         get: { NlsChoice.normalized(game.nls) },
                         set: { library.updateNls(game: game, nls: $0) }

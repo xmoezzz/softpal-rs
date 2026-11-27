@@ -13,7 +13,7 @@ use crate::input::PalInputState;
 use crate::platform_time::{Duration, Instant};
 use crate::runtime::{RuntimeStatus, RuntimeTick, ScriptRuntime, ScriptRuntimeConfig, WaitRequest};
 use crate::scene::{DrawCommand, FrameScene};
-use crate::sprite::SpriteSystem;
+use crate::sprite::{SpriteSurfaceId, SpriteSystem};
 use crate::task::TaskSystem;
 
 const MAX_PAL_FRAME_DELTA: Duration = Duration::from_millis(100);
@@ -72,6 +72,7 @@ pub struct Engine {
     last_runtime_status: RuntimeStatus,
     input: PalInputState,
     window_physical_size: (u32, u32),
+    host_gpu_renderer: bool,
     pal_debug: bool,
     last_scene: Option<FrameScene>,
     scene_transition: Option<SceneTransition>,
@@ -103,6 +104,7 @@ impl Engine {
     }
 
     pub fn set_host_gpu_renderer(&mut self, enabled: bool) {
+        self.host_gpu_renderer = enabled;
         if let Some(runtime) = &mut self.runtime {
             runtime.set_host_gpu_renderer(enabled);
         }
@@ -240,6 +242,7 @@ impl Engine {
             last_runtime_status,
             input: PalInputState::new(),
             window_physical_size: fallback_size,
+            host_gpu_renderer: false,
             pal_debug: pal_debug_enabled(),
             last_scene: None,
             scene_transition: None,
@@ -816,7 +819,7 @@ impl Engine {
             .runtime
             .as_ref()
             .and_then(ScriptRuntime::effect_render_state);
-        let mut scene = self.compose_scene(timing.elapsed, logical_width, logical_height);
+        let mut scene = self.compose_scene(timing, logical_width, logical_height);
         if let Some(effect) = effect {
             if !self.scene_transition.as_ref().is_some_and(|transition| {
                 transition.start_ms == effect.start_ms && transition.effect_id == effect.effect_id
@@ -978,15 +981,21 @@ impl Engine {
 
     fn compose_scene(
         &mut self,
-        elapsed: Duration,
+        timing: FrameTiming,
         logical_width: u32,
         logical_height: u32,
     ) -> FrameScene {
-        let mut scene = FrameScene::from_runtime_status(&self.last_runtime_status, elapsed)
+        let mut scene = FrameScene::from_runtime_status(&self.last_runtime_status, timing.elapsed)
             .with_logical_size(logical_width, logical_height);
         scene.raster_stage = self.sprites.global_raster_stage();
         let mut sprite_commands = self.sprites.commands();
-        sprite_commands.extend(self.sprites.transition_commands());
+        let shake = self.runtime.as_ref().map_or([0, 0], ScriptRuntime::effect_shake_offset);
+        if shake != [0, 0] {
+            translate_scene_commands(&mut sprite_commands, shake[0], shake[1]);
+        }
+        sprite_commands.extend(self.sprites.compose_transitions(
+            &mut scene, timing.frame_index, shake, true,
+        ));
         // Transition sprites participate in the same PAL render tree as normal
         // sprites. Appending them after all live sprites lets background
         // transitions overdraw ADV text/buttons despite lower z/priority.
@@ -995,23 +1004,27 @@ impl Engine {
             crate::scene::DrawCommand::SolidQuad(_) => i32::MAX,
         });
         self.sprites.resolve_main_draw_state(&mut sprite_commands);
+        scene.commands = sprite_commands;
+        scene.materialize_software_crossfades(self.host_gpu_renderer, |id| {
+            self.sprites
+                .surface(SpriteSurfaceId(id.0))
+                .map(|surface| surface.to_scene_texture())
+        });
         let mut used_textures = HashSet::new();
-        for command in &sprite_commands {
+        for command in &scene.commands {
             if let crate::scene::DrawCommand::Sprite(sprite) = command {
                 used_textures.insert(sprite.texture_id);
             }
+        }
+        for fade in &scene.sprite_crossfades {
+            used_textures.extend(fade.layers.iter().map(|layer| layer.texture_id));
         }
         for texture in self.sprites.textures() {
             if used_textures.contains(&texture.id) {
                 scene.textures.push(texture.clone());
             }
         }
-        scene.commands.extend(sprite_commands);
         if let Some(runtime) = self.runtime.as_ref() {
-            let shake = runtime.effect_shake_offset();
-            if shake != [0, 0] {
-                translate_scene_commands(&mut scene.commands, shake[0], shake[1]);
-            }
             if let Some(quad) = runtime.effect_overlay(logical_width, logical_height) {
                 scene
                     .commands

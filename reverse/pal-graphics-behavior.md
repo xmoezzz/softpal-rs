@@ -164,9 +164,22 @@ The portable transition adapter now declares these five exports in
 `reverse/abi/graphics32.json`, preserves states 0/1/2/3, uses the absolute wrapping
 clock, leaves completion attached, and releases only the second sprite on cancel.
 The Game wrapper explicitly retires completed workers. Type-1 modulation uses
-truncated byte alpha; the two-sprite outgoing alpha is the first sprite's alpha
-minus its incoming portion. The current two ordinary textured draws still differ
-from the native intermediate render-target combine and newer placement sharing.
+truncated byte alpha. The two-sprite outgoing alpha is the first sprite's alpha
+minus its incoming portion.
+
+The portable type-1 path combines two standard alpha sprites on a transparent
+intermediate layer, using weighted premultiplied color and coverage. It draws
+the result once at the transition's priority. Drawing the weighted images
+separately with source-over showed the background through opaque overlapping
+pixels. Single-sprite fades and nonstandard blend modes use their existing draw
+paths. Native intermediate target precision and newer placement sharing remain
+open for comparison.
+
+The official Simplified Chinese release reproduced this on a 300 ms replacement
+from `ST05A_B060` to `ST05A_B140`. The recorded frames before and after the
+effect matched between builds. The midpoint retained opaque coverage after the
+fix, and a synthetic test checks the overlap and both exposed edges over an
+opaque background.
 
 ## Pixel operations and filters
 

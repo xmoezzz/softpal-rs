@@ -652,6 +652,10 @@ impl SenaApplication {
                 return;
             }
         };
+        if matches!(frame.runtime_status, RuntimeStatus::Halted { .. }) {
+            event_loop.exit();
+            return;
+        }
         self.apply_window_requests();
         let Some(renderer) = self.renderer.as_mut() else {
             self.engine.input_begin_frame();

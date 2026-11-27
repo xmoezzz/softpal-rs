@@ -53,6 +53,22 @@ enum NlsChoice: String, CaseIterable, Codable, Identifiable {
     }
 }
 
+enum GameLanguage: String, CaseIterable, Codable, Identifiable {
+    case japanese = "jp"
+    case simplifiedChinese = "cn"
+    case traditionalChinese = "tc"
+
+    var id: String { rawValue }
+
+    var label: String {
+        switch self {
+        case .japanese: return "Japanese"
+        case .simplifiedChinese: return "Simplified Chinese"
+        case .traditionalChinese: return "Traditional Chinese"
+        }
+    }
+}
+
 struct GameEntry: Identifiable, Codable, Equatable {
     let id: String
     var title: String
@@ -62,6 +78,7 @@ struct GameEntry: Identifiable, Codable, Equatable {
     var lastPlayedAtUnix: Int64?
     var coverPath: String?
     var nls: String
+    var language: GameLanguage
 
     init(
         id: String,
@@ -70,7 +87,8 @@ struct GameEntry: Identifiable, Codable, Equatable {
         addedAtUnix: Int64,
         lastPlayedAtUnix: Int64? = nil,
         coverPath: String? = nil,
-        nls: String = NlsChoice.shiftJis.rawValue
+        nls: String = NlsChoice.shiftJis.rawValue,
+        language: GameLanguage = .japanese
     ) {
         self.id = id
         self.title = title
@@ -79,6 +97,7 @@ struct GameEntry: Identifiable, Codable, Equatable {
         self.lastPlayedAtUnix = lastPlayedAtUnix
         self.coverPath = coverPath
         self.nls = NlsChoice.normalized(nls).rawValue
+        self.language = language
     }
 
     enum CodingKeys: String, CodingKey {
@@ -89,6 +108,7 @@ struct GameEntry: Identifiable, Codable, Equatable {
         case lastPlayedAtUnix
         case coverPath
         case nls
+        case language
     }
 
     init(from decoder: Decoder) throws {
@@ -100,6 +120,7 @@ struct GameEntry: Identifiable, Codable, Equatable {
         lastPlayedAtUnix = try c.decodeIfPresent(Int64.self, forKey: .lastPlayedAtUnix)
         coverPath = try c.decodeIfPresent(String.self, forKey: .coverPath)
         nls = NlsChoice.normalized(try c.decodeIfPresent(String.self, forKey: .nls)).rawValue
+        language = GameLanguage(rawValue: try c.decodeIfPresent(String.self, forKey: .language) ?? "") ?? .japanese
     }
 
     func encode(to encoder: Encoder) throws {
@@ -111,6 +132,7 @@ struct GameEntry: Identifiable, Codable, Equatable {
         try c.encodeIfPresent(lastPlayedAtUnix, forKey: .lastPlayedAtUnix)
         try c.encodeIfPresent(coverPath, forKey: .coverPath)
         try c.encode(NlsChoice.normalized(nls).rawValue, forKey: .nls)
+        try c.encode(language, forKey: .language)
     }
 }
 
@@ -189,8 +211,12 @@ final class GameLibrary: ObservableObject {
 
     // MARK: - Scan games in Documents/sena
     func rescanFromDocuments() {
-        // Preserve per-game settings (last played, etc.) from library.json.
-        let savedById: [String: GameEntry] = Dictionary(uniqueKeysWithValues: games.map { ($0.id, $0) })
+        // Folder names are unique within Documents/sena and survive process
+        // restarts and sandbox relocations. Old library IDs used Swift hashes.
+        let savedByFolder = Dictionary(
+            games.map { (URL(fileURLWithPath: $0.rootPath).lastPathComponent, $0) },
+            uniquingKeysWith: { first, _ in first }
+        )
         var out: [GameEntry] = []
 
         let now = Int64(Date().timeIntervalSince1970)
@@ -207,16 +233,19 @@ final class GameLibrary: ObservableObject {
             if !isDir { continue }
 
             let gameRoot = url
-            let id = stableId(for: gameRoot.path)
-
-            let saved = savedById[id]
+            let saved = savedByFolder[gameRoot.lastPathComponent]
+            let id = gameRoot.lastPathComponent
             let title = senaGameName(for: gameRoot)
             let addedAt = saved?.addedAtUnix ?? now
             let lastPlayed = saved?.lastPlayedAtUnix
             let coverPath = senaGameCoverPath(for: gameRoot)
             let nls = saved?.nls ?? defaultNls.rawValue
 
-            out.append(GameEntry(id: id, title: title, rootPath: gameRoot.path, addedAtUnix: addedAt, lastPlayedAtUnix: lastPlayed, coverPath: coverPath, nls: nls))
+            out.append(GameEntry(
+                id: id, title: title, rootPath: gameRoot.path, addedAtUnix: addedAt,
+                lastPlayedAtUnix: lastPlayed, coverPath: coverPath, nls: nls,
+                language: saved?.language ?? .japanese
+            ))
         }
 
         // Stable-ish ordering: recently played first, then newest.
@@ -242,17 +271,23 @@ final class GameLibrary: ObservableObject {
 
     // MARK: - Launch
     func launch(game: GameEntry) {
-        if let idx = games.firstIndex(of: game) {
-            games[idx].lastPlayedAtUnix = Int64(Date().timeIntervalSince1970)
-            save()
-        }
+        guard let idx = games.firstIndex(where: { $0.id == game.id }) else { return }
+        games[idx].lastPlayedAtUnix = Int64(Date().timeIntervalSince1970)
+        save()
         // Present the in-app player (SwiftUI owns the main loop).
-        activeGame = game
+        activeGame = games[idx]
     }
 
     func updateNls(game: GameEntry, nls: NlsChoice) {
         if let idx = games.firstIndex(where: { $0.id == game.id }) {
             games[idx].nls = nls.rawValue
+            save()
+        }
+    }
+
+    func updateLanguage(game: GameEntry, language: GameLanguage) {
+        if let idx = games.firstIndex(where: { $0.id == game.id }) {
+            games[idx].language = language
             save()
         }
     }
@@ -265,11 +300,6 @@ final class GameLibrary: ObservableObject {
     func loadCoverImage(game: GameEntry) -> UIImage? {
         guard let coverPath = game.coverPath, !coverPath.isEmpty else { return nil }
         return UIImage(contentsOfFile: coverPath)
-    }
-
-    private func stableId(for path: String) -> String {
-        // Stable enough for local library usage.
-        return String(path.hashValue, radix: 16)
     }
 
     private func looksLikeGameRoot(_ dir: URL) -> Bool {

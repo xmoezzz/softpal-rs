@@ -42,6 +42,8 @@ fn messagebox_results() -> &'static Mutex<HashMap<usize, (u64, bool)>> {
 pub struct SenaFfiHost {
     engine: Engine,
     rgba: Vec<u8>,
+    #[cfg(all(feature = "desktop", any(target_os = "macos", target_os = "ios")))]
+    ios_renderer: Option<crate::renderer::wgpu_backend::WgpuBackend>,
     scene_rendering: bool,
     native_scene: Option<NativeScene>,
     frame_width: u32,
@@ -412,6 +414,8 @@ pub unsafe extern "C" fn sena_host_create(
     Box::into_raw(Box::new(SenaFfiHost {
         engine,
         rgba: Vec::new(),
+        #[cfg(all(feature = "desktop", any(target_os = "macos", target_os = "ios")))]
+        ios_renderer: None,
         frame_width: surface_width.max(1),
         frame_height: surface_height.max(1),
         frame_generation: 0,
@@ -483,7 +487,29 @@ pub extern "C" fn sena_host_step(handle: *mut c_void, dt_ms: u32) -> i32 {
             frame.scene.commands.len(),
         );
     }
-    if host.scene_rendering {
+    #[cfg(all(feature = "desktop", any(target_os = "macos", target_os = "ios")))]
+    let presented = if let Some(renderer) = host.ios_renderer.as_mut() {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            renderer.render(&frame.scene, crate::renderer::RendererConfig::default().clear_color)
+        }))
+        .unwrap_or_else(|_| Err(anyhow::anyhow!("Metal presentation panicked")));
+        match result {
+            Ok(_) => true,
+            Err(error) => {
+                eprintln!("[SENA_IOS_METAL] presentation failed: {error:#}");
+                host.ios_renderer = None;
+                host.engine.set_host_gpu_renderer(false);
+                false
+            }
+        }
+    } else {
+        false
+    };
+    #[cfg(not(all(feature = "desktop", any(target_os = "macos", target_os = "ios"))))]
+    let presented = false;
+    if presented {
+        host.rgba.clear();
+    } else if host.scene_rendering {
         host.native_scene = Some(NativeScene::new(frame.scene));
         host.rgba.clear();
     } else {
@@ -774,6 +800,42 @@ pub unsafe extern "C" fn sena_ios_create(
     )
 }
 
+/// Attach a borrowed CAMetalLayer on the main thread before stepping the host.
+/// Swift keeps the layer alive until destruction. Zero leaves CPU presentation active.
+#[cfg(all(feature = "desktop", any(target_os = "macos", target_os = "ios")))]
+#[no_mangle]
+pub unsafe extern "C" fn sena_ios_attach_metal_layer(
+    handle: *mut c_void,
+    layer: *mut c_void,
+    width: u32,
+    height: u32,
+) -> i32 {
+    let Some(host) = host_from_handle(handle) else { return 0 };
+    if layer.is_null() || host.ios_renderer.is_some() || host.frame_generation != 0 {
+        return 0;
+    }
+    let size = winit::dpi::PhysicalSize::new(width.max(1), height.max(1));
+    let created = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+        pollster::block_on(crate::renderer::wgpu_backend::WgpuBackend::from_metal_layer(layer, size))
+    }));
+    match created {
+        Ok(Ok(renderer)) => {
+            host.ios_renderer = Some(renderer);
+            host.engine.set_host_gpu_renderer(true);
+            eprintln!("[SENA_IOS_METAL] presenting at {}x{} pixels", size.width, size.height);
+            1
+        }
+        Ok(Err(error)) => {
+            eprintln!("[SENA_IOS_METAL] initialization failed: {error:#}");
+            0
+        }
+        Err(_) => {
+            eprintln!("[SENA_IOS_METAL] initialization panicked");
+            0
+        }
+    }
+}
+
 #[no_mangle]
 pub extern "C" fn sena_ios_resize_viewport(
     handle: *mut c_void,
@@ -785,6 +847,10 @@ pub extern "C" fn sena_ios_resize_viewport(
     viewport_height: u32,
 ) {
     sena_host_resize(handle, viewport_width.max(1), viewport_height.max(1));
+    #[cfg(all(feature = "desktop", any(target_os = "macos", target_os = "ios")))]
+    if let Some(renderer) = host_from_handle(handle).and_then(|host| host.ios_renderer.as_mut()) {
+        renderer.resize(winit::dpi::PhysicalSize::new(viewport_width.max(1), viewport_height.max(1)));
+    }
 }
 
 #[no_mangle]
@@ -834,7 +900,7 @@ pub extern "C" fn sena_ios_step(handle: *mut c_void, dt_ms: u32) -> i32 {
 
 #[no_mangle]
 pub extern "C" fn sena_ios_resize(handle: *mut c_void, surface_width: u32, surface_height: u32) {
-    sena_host_resize(handle, surface_width, surface_height);
+    sena_ios_resize_viewport(handle, surface_width, surface_height, 0, 0, surface_width, surface_height);
 }
 
 #[no_mangle]
@@ -948,6 +1014,8 @@ mod native_messagebox_tests {
         Box::new(SenaFfiHost {
             engine: Engine::new(config).unwrap(),
             rgba: vec![],
+            #[cfg(all(feature = "desktop", any(target_os = "macos", target_os = "ios")))]
+            ios_renderer: None,
             frame_width: 1280,
             frame_height: 720,
             frame_generation: 0,

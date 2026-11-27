@@ -1,5 +1,5 @@
 use pal_vm::{
-    DrawCommand, PalColor, PalPoint2, PalPoint3, PalRect, PalRenderMode, PalVec3, SceneTexture,
+    DrawCommand, FrameScene, PalColor, PalPoint2, PalPoint3, PalRect, PalRenderMode, PalVec3, SceneTexture,
     SceneTextureId, SpriteDesc, SpriteSurfaceId, SpriteSystem,
 };
 
@@ -628,15 +628,19 @@ fn sprite_transition_handle_marks_and_cancels_participating_sprites() {
     assert_eq!(sprites.get(from).unwrap().transition_block, 1);
     assert_eq!(sprites.get(to).unwrap().transition_block, 1);
     assert!(sprites.commands().is_empty());
-    assert_eq!(sprites.transition_commands().len(), 2);
+    let mut scene = FrameScene::boot().with_logical_size(64, 32);
+    assert_eq!(sprites.transition_commands(&mut scene, 1, [0, 0]).len(), 1);
+    assert!(scene.textures.is_empty());
 
     sprites.advance_transitions(1250, false);
-    let commands = sprites.transition_commands();
-    assert_eq!(commands.len(), 2);
-    let DrawCommand::Sprite(to_draw) = &commands[1] else {
+    let commands = sprites.transition_commands(&mut scene, 2, [0, 0]);
+    assert_eq!(commands.len(), 1);
+    assert_eq!(scene.textures.len(), 1);
+    let DrawCommand::Sprite(combined) = &commands[0] else {
         panic!("transition target must be drawn as sprite");
     };
-    assert_eq!(to_draw.color[3], 127.0 / 255.0);
+    assert_eq!(combined.texture_id, scene.textures[0].id);
+    assert_eq!(scene.textures[0].pixels.as_slice(), vec![255; 64 * 32 * 4]);
 
     sprites.advance_transitions(1500, false);
     assert_eq!(sprites.transition_state(transition), 2);
@@ -650,6 +654,28 @@ fn sprite_transition_handle_marks_and_cancels_participating_sprites() {
     assert!(!sprites.cancel_transition(transition));
     assert!(sprites.release_transition_handle(transition));
     assert_eq!(sprites.transition_state(transition), 3);
+}
+
+#[test]
+fn sprite_transition_blends_coverage_before_drawing_over_the_background() {
+    let mut sprites = SpriteSystem::new();
+    let old = sprites.create_rgba_sprite(
+        2, 1, [255, 0, 0, 255].repeat(2), PalVec3::default(), 0, "old",
+    ).unwrap();
+    let new = sprites.create_rgba_sprite(
+        2, 1, [0, 255, 0, 255].repeat(2), PalVec3::new(1, 0, 0), 0, "new",
+    ).unwrap();
+    let transition = sprites.create_transition_handle();
+    assert!(sprites.set_transition(transition, 1, Some(new), Some(old), 1, 0, 100));
+    sprites.advance_transitions(50, false);
+
+    let mut scene = FrameScene::boot().with_logical_size(3, 1);
+    scene.clear_color = [0.0, 0.0, 1.0, 1.0];
+    scene.commands = sprites.transition_commands(&mut scene, 1, [0, 0]);
+    assert_eq!(
+        pal_vm::scene::rasterize_scene_rgba(&scene),
+        [128, 0, 127, 255, 128, 127, 0, 255, 0, 127, 128, 255],
+    );
 }
 
 #[test]
@@ -669,7 +695,7 @@ fn screen_copy_sprite_is_released_only_when_transition_is_cancelled() {
     let transition = sprites.create_transition_handle();
 
     assert!(sprites.set_transition(transition, 1, None, Some(backbuffer), 1, 0, 16));
-    assert_eq!(sprites.transition_commands().len(), 1);
+    assert_eq!(sprites.transition_commands(&mut FrameScene::boot(), 1, [0, 0]).len(), 1);
     sprites.advance_transitions(16, false);
 
     assert_eq!(sprites.transition_state(transition), 2);
@@ -705,7 +731,7 @@ fn unsupported_transition_and_both_null_preserve_native_state() {
     assert!(sprites.set_transition(transition, 1, Some(first), None, -1, 0, 1));
     sprites.advance_transitions(100, true);
     assert_eq!(sprites.transition_state(transition), 1);
-    assert!(sprites.transition_commands().is_empty());
+    assert!(sprites.transition_commands(&mut FrameScene::boot(), 1, [0, 0]).is_empty());
     assert_eq!(sprites.get(first).unwrap().transition_block, u32::MAX);
     assert!(!sprites.set_transition(transition, 1, None, None, 1, 0, 0));
     assert_eq!(sprites.transition_state(transition), 1);

@@ -52,6 +52,22 @@ enum NlsChoice: String, CaseIterable, Codable, Identifiable {
     }
 }
 
+enum GameLanguage: String, CaseIterable, Codable, Identifiable {
+    case japanese = "jp"
+    case simplifiedChinese = "cn"
+    case traditionalChinese = "tc"
+
+    var id: String { rawValue }
+
+    var label: String {
+        switch self {
+        case .japanese: return "Japanese"
+        case .simplifiedChinese: return "Simplified Chinese"
+        case .traditionalChinese: return "Traditional Chinese"
+        }
+    }
+}
+
 // -----------------------------
 // Model
 // -----------------------------
@@ -63,8 +79,9 @@ struct GameEntry: Identifiable, Codable, Equatable {
     var lastPlayedAtUnix: Int64?
     var coverPath: String?
     var nls: String
+    var language: GameLanguage
 
-    init(id: String, title: String, rootPath: String, addedAtUnix: Int64, lastPlayedAtUnix: Int64? = nil, coverPath: String? = nil, nls: String = NlsChoice.shiftJis.rawValue) {
+    init(id: String, title: String, rootPath: String, addedAtUnix: Int64, lastPlayedAtUnix: Int64? = nil, coverPath: String? = nil, nls: String = NlsChoice.shiftJis.rawValue, language: GameLanguage = .japanese) {
         self.id = id
         self.title = title
         self.rootPath = rootPath
@@ -72,6 +89,7 @@ struct GameEntry: Identifiable, Codable, Equatable {
         self.lastPlayedAtUnix = lastPlayedAtUnix
         self.coverPath = coverPath
         self.nls = NlsChoice.normalized(nls).rawValue
+        self.language = language
     }
 
     enum CodingKeys: String, CodingKey {
@@ -82,6 +100,7 @@ struct GameEntry: Identifiable, Codable, Equatable {
         case lastPlayedAtUnix
         case coverPath
         case nls
+        case language
     }
 
     init(from decoder: Decoder) throws {
@@ -93,6 +112,7 @@ struct GameEntry: Identifiable, Codable, Equatable {
         lastPlayedAtUnix = try c.decodeIfPresent(Int64.self, forKey: .lastPlayedAtUnix)
         coverPath = try c.decodeIfPresent(String.self, forKey: .coverPath)
         nls = NlsChoice.normalized(try c.decodeIfPresent(String.self, forKey: .nls)).rawValue
+        language = GameLanguage(rawValue: try c.decodeIfPresent(String.self, forKey: .language) ?? "") ?? .japanese
     }
 }
 
@@ -103,6 +123,7 @@ struct PendingImport: Identifiable {
     let title: String
     let coverPath: String?
     var nls: NlsChoice = .shiftJis
+    var language: GameLanguage = .japanese
 }
 
 @MainActor
@@ -177,7 +198,11 @@ final class GameLibrary: ObservableObject {
         let path = url.path
         let id = stableId(for: path)
         let coverPath = senaGameCoverPath(for: url)
-        pendingImport = PendingImport(id: id, rootURL: url, rootPath: path, title: title, coverPath: coverPath)
+        let existing = games.first { $0.rootPath == path }
+        pendingImport = PendingImport(
+            id: existing?.id ?? id, rootURL: url, rootPath: path, title: title, coverPath: coverPath,
+            nls: NlsChoice.normalized(existing?.nls), language: existing?.language ?? .japanese
+        )
     }
 
     func commitImport(p: PendingImport) {
@@ -188,8 +213,9 @@ final class GameLibrary: ObservableObject {
             games[idx].title = p.title
             games[idx].coverPath = p.coverPath
             games[idx].nls = p.nls.rawValue
+            games[idx].language = p.language
         } else {
-            games.append(GameEntry(id: p.id, title: p.title, rootPath: p.rootPath, addedAtUnix: now, coverPath: p.coverPath, nls: p.nls.rawValue))
+            games.append(GameEntry(id: p.id, title: p.title, rootPath: p.rootPath, addedAtUnix: now, coverPath: p.coverPath, nls: p.nls.rawValue, language: p.language))
         }
         pendingImport = nil
         save()
@@ -239,6 +265,13 @@ final class GameLibrary: ObservableObject {
     func updateNls(game: GameEntry, nls: NlsChoice) {
         if let idx = games.firstIndex(where: { $0.id == game.id }) {
             games[idx].nls = nls.rawValue
+            save()
+        }
+    }
+
+    func updateLanguage(game: GameEntry, language: GameLanguage) {
+        if let idx = games.firstIndex(where: { $0.id == game.id }) {
+            games[idx].language = language
             save()
         }
     }
