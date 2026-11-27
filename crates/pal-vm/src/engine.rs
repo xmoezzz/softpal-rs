@@ -13,7 +13,7 @@ use crate::input::PalInputState;
 use crate::platform_time::{Duration, Instant};
 use crate::runtime::{RuntimeStatus, RuntimeTick, ScriptRuntime, ScriptRuntimeConfig, WaitRequest};
 use crate::scene::{DrawCommand, FrameScene};
-use crate::sprite::SpriteSystem;
+use crate::sprite::{SpriteSurfaceId, SpriteSystem};
 use crate::task::TaskSystem;
 
 const MAX_PAL_FRAME_DELTA: Duration = Duration::from_millis(100);
@@ -994,7 +994,7 @@ impl Engine {
             translate_scene_commands(&mut sprite_commands, shake[0], shake[1]);
         }
         sprite_commands.extend(self.sprites.compose_transitions(
-            &mut scene, timing.frame_index, shake, self.host_gpu_renderer,
+            &mut scene, timing.frame_index, shake, true,
         ));
         // Transition sprites participate in the same PAL render tree as normal
         // sprites. Appending them after all live sprites lets background
@@ -1004,8 +1004,14 @@ impl Engine {
             crate::scene::DrawCommand::SolidQuad(_) => i32::MAX,
         });
         self.sprites.resolve_main_draw_state(&mut sprite_commands);
+        scene.commands = sprite_commands;
+        scene.materialize_software_crossfades(self.host_gpu_renderer, |id| {
+            self.sprites
+                .surface(SpriteSurfaceId(id.0))
+                .map(|surface| surface.to_scene_texture())
+        });
         let mut used_textures = HashSet::new();
-        for command in &sprite_commands {
+        for command in &scene.commands {
             if let crate::scene::DrawCommand::Sprite(sprite) = command {
                 used_textures.insert(sprite.texture_id);
             }
@@ -1018,7 +1024,6 @@ impl Engine {
                 scene.textures.push(texture.clone());
             }
         }
-        scene.commands.extend(sprite_commands);
         if let Some(runtime) = self.runtime.as_ref() {
             if let Some(quad) = runtime.effect_overlay(logical_width, logical_height) {
                 scene

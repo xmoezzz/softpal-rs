@@ -24,6 +24,30 @@ pub(crate) struct SpriteCrossfade {
     pub layers: [SpriteDraw; 2],
 }
 
+impl SpriteCrossfade {
+    fn composite(
+        &self,
+        draw: &SpriteDraw,
+        width: u32,
+        height: u32,
+        mut texture: impl FnMut(SceneTextureId) -> Option<SceneTexture>,
+    ) -> Option<(SpriteDraw, SceneTexture)> {
+        let [old, new] = self.layers.map(|mut layer| {
+            layer.blend_state = draw.effective_blend_state();
+            layer
+        });
+        let old_texture = texture(old.texture_id)?;
+        let new_texture = texture(new.texture_id)?;
+        combine_sprite_transition(
+            self.output,
+            self.generation,
+            width,
+            height,
+            [(old, &old_texture), (new, &new_texture)],
+        )
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct RasterStage {
     pub priority: i32,
@@ -86,6 +110,31 @@ impl FrameScene {
     pub fn with_command(mut self, command: DrawCommand) -> Self {
         self.commands.push(command);
         self
+    }
+
+    pub(crate) fn materialize_software_crossfades(
+        &mut self,
+        gpu: bool,
+        mut texture: impl FnMut(SceneTextureId) -> Option<SceneTexture>,
+    ) {
+        for fade in std::mem::take(&mut self.sprite_crossfades) {
+            if gpu && fade.layers.iter().all(|layer| layer.raster_fx.is_none()) {
+                self.sprite_crossfades.push(fade);
+                continue;
+            }
+            let Some(draw) = self.commands.iter_mut().find_map(|command| match command {
+                DrawCommand::Sprite(draw) if draw.texture_id == fade.output => Some(draw),
+                _ => None,
+            }) else {
+                continue;
+            };
+            if let Some((composite, pixels)) =
+                fade.composite(draw, self.logical_width, self.logical_height, &mut texture)
+            {
+                *draw = composite;
+                self.textures.push(pixels);
+            }
+        }
     }
 }
 
@@ -326,14 +375,9 @@ fn rasterize_scene_rgba_inner(scene: &FrameScene, preserve_alpha: bool) -> Vec<u
                 let combined = scene.sprite_crossfades.iter()
                     .find(|fade| fade.output == sprite.texture_id)
                     .and_then(|fade| {
-                        let texture = |draw: SpriteDraw| {
-                            scene.textures.iter().find(|tex| tex.id == draw.texture_id)
-                        };
-                        let [old, new] = fade.layers;
-                        combine_sprite_transition(
-                            fade.output, fade.generation, width, height,
-                            [(old, texture(old)?), (new, texture(new)?)],
-                        )
+                        fade.composite(sprite, width, height, |id| {
+                            scene.textures.iter().find(|texture| texture.id == id).cloned()
+                        })
                     });
                 let source = combined.as_ref().map(|(draw, texture)| (draw, texture))
                     .or_else(|| {
@@ -403,6 +447,7 @@ pub(crate) fn combine_sprite_transition(
     let mut draw = SpriteDraw::full_frame(&texture, width, height);
     draw.dst = dst;
     draw.priority = layers[1].0.priority;
+    draw.blend_state = layers[1].0.effective_blend_state();
     Some((draw, texture))
 }
 

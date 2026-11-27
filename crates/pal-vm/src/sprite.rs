@@ -498,7 +498,7 @@ impl SpriteSystem {
         scene: &mut FrameScene,
         frame_index: u64,
         shake: [i32; 2],
-        gpu: bool,
+        defer_compositing: bool,
     ) -> Vec<DrawCommand> {
         let mut commands = Vec::new();
         for (handle, transition) in &self.transitions {
@@ -562,7 +562,7 @@ impl SpriteSystem {
                         // Keep transient IDs distinct from arena surfaces and
                         // reserved full-frame effect textures.
                         let texture_id = SceneTextureId(u64::MAX - 0x100 - u64::from(handle.0));
-                        if gpu && old.raster_fx.is_none() && new.raster_fx.is_none() {
+                        if defer_compositing {
                             let layers = [old, new];
                             if let Some(dst) = crossfade_bounds(
                                 layers, scene.logical_width, scene.logical_height,
@@ -574,6 +574,7 @@ impl SpriteSystem {
                                 draw.source_rect = [0, 0, dst.w as i32, dst.h as i32];
                                 draw.rotation = [0.0; 3];
                                 draw.color = [1.0; 4];
+                                draw.raster_fx = None;
                                 scene.sprite_crossfades.push(SpriteCrossfade {
                                     output: texture_id, generation: frame_index, layers,
                                 });

@@ -250,6 +250,7 @@ fn fs_crossfade(in: VertexOutput) -> @location(0) vec4<f32> {
 struct GpuCrossfade {
     sources: [wgpu::BindGroup; 2],
     uniforms: wgpu::BindGroup,
+    blend_disabled: bool,
 }
 
 struct GpuTexture {
@@ -282,7 +283,7 @@ pub struct WgpuBackend {
     config: wgpu::SurfaceConfiguration,
     pipelines: Vec<wgpu::RenderPipeline>,
     raster_pipelines: Vec<wgpu::RenderPipeline>,
-    crossfade_pipeline: wgpu::RenderPipeline,
+    crossfade_pipelines: [wgpu::RenderPipeline; 2],
     crossfade_bind_layout: wgpu::BindGroupLayout,
     raster_bind_layout: wgpu::BindGroupLayout,
     sampler_nearest: wgpu::Sampler,
@@ -480,8 +481,9 @@ impl WgpuBackend {
             label: Some("PAL sprite crossfade shader"),
             source: wgpu::ShaderSource::Wgsl(format!("{SPRITE_SHADER}{CROSSFADE_SHADER}").into()),
         });
-        let crossfade_pipeline =
-            sprite_pipeline(&crossfade_layout, &crossfade_shader, "fs_crossfade", 1);
+        let crossfade_pipelines = [1, 11].map(|mode| {
+            sprite_pipeline(&crossfade_layout, &crossfade_shader, "fs_crossfade", mode)
+        });
 
         let raster_bind_layout = raster_bind_layout(&device);
         let raster_pipelines = (0..12)
@@ -553,7 +555,7 @@ impl WgpuBackend {
             config,
             pipelines,
             raster_pipelines,
-            crossfade_pipeline,
+            crossfade_pipelines,
             crossfade_bind_layout,
             raster_bind_layout,
             sampler_nearest,
@@ -718,7 +720,9 @@ impl WgpuBackend {
                         .iter()
                         .find(|fade| fade.output == sprite.texture_id)
                     {
-                        if let Some(prepared) = self.prepare_crossfade(fade, scale) {
+                        if let Some(prepared) =
+                            self.prepare_crossfade(fade, sprite.effective_blend_state(), scale)
+                        {
                             push_quad_vertices(
                                 &mut vertices,
                                 &mut spans,
@@ -831,7 +835,7 @@ impl WgpuBackend {
                     SpanBinding::White => Some(&self.white_bind_nearest),
                     SpanBinding::Crossfade(index) => {
                         let fade = &crossfades[index];
-                        pass.set_pipeline(&self.crossfade_pipeline);
+                        pass.set_pipeline(&self.crossfade_pipelines[usize::from(fade.blend_disabled)]);
                         pass.set_bind_group(0, &fade.sources[0], &[]);
                         pass.set_bind_group(1, &fade.sources[1], &[]);
                         pass.set_bind_group(2, &fade.uniforms, &[]);
@@ -857,7 +861,12 @@ impl WgpuBackend {
         Ok(RenderOutcome::Rendered)
     }
 
-    fn prepare_crossfade(&self, fade: &SpriteCrossfade, scale: [f32; 2]) -> Option<GpuCrossfade> {
+    fn prepare_crossfade(
+        &self,
+        fade: &SpriteCrossfade,
+        blend_state: crate::scene::blend::NativeDrawState,
+        scale: [f32; 2],
+    ) -> Option<GpuCrossfade> {
         let prepare = |sprite: &SpriteDraw| {
             let texture = self.textures.get(&sprite.texture_id)?;
             let (smooth, uv) = self.sprite_sampling(sprite, texture, scale);
@@ -873,8 +882,7 @@ impl WgpuBackend {
                 [origin[0], origin[1], 0.0, 0.0],
                 [v[1] / det, -v[0] / det, -u[1] / det, u[0] / det],
                 uv,
-                sprite.effective_blend_state().modulation(sprite.color)
-                    .map(|channel| channel.clamp(0.0, 1.0)),
+                blend_state.modulation(sprite.color).map(|channel| channel.clamp(0.0, 1.0)),
             ];
             let source = if smooth { &texture.bind_linear } else { &texture.bind_nearest };
             Some((source.clone(), uniform))
@@ -888,6 +896,7 @@ impl WgpuBackend {
         });
         Some(GpuCrossfade {
             sources: [old_source, new_source],
+            blend_disabled: blend_state.blend_disabled,
             uniforms: self.device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("PAL sprite crossfade uniforms"),
                 layout: &self.crossfade_bind_layout,
